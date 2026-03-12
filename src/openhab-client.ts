@@ -60,8 +60,15 @@ export class OpenHabClient {
       (response) => response,
       (error) => {
         if (error.response) {
+          let hint = '';
+          if (error.response.status === 401) {
+            const endpoint = error.config?.url || '';
+            if (endpoint.includes('/rest/things') || endpoint.includes('/rest/systeminfo')) {
+              hint = ' - This endpoint may require "Admin" or "Full Access" token scopes.';
+            }
+          }
           throw new Error(
-            `OpenHAB API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`
+            `OpenHAB API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}${hint}`
           );
         } else if (error.request) {
           throw new Error(`OpenHAB Network Error: No response received connecting to ${baseUrl}`);
