@@ -1,43 +1,43 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { OpenHabClient } from './openhab-client.js';
-import { OpenHabItem } from './types.js';
 
-export function registerTools(server: Server, client: OpenHabClient) {
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+export function registerTools(server: McpServer, client: OpenHabClient) {
+  server.server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
-        // --- Core Items ---
+        // ─── Tier 1: Core standalone ──────────────────────────────────────────
         {
-          name: 'get_system_summary',
-          description: 'Get a high-density summary of the OpenHAB system (items, things, rooms, health)',
+          name: 'initial_discovery',
+          description:
+            'One-shot bootstrap: returns a compact guidance context with a room-grouped quick-reference of every item (name, type, live state). Call ONCE on first contact. Do NOT also call generate_home_blueprint or get_system_summary — this covers all discovery needs.',
           inputSchema: { type: 'object', properties: {} },
         },
         {
-          name: 'get_items',
-          description: 'Get all OpenHAB items, optionally filtered by tags, type, or metadata',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              tags: { type: 'string', description: 'Comma-separated list of tags' },
-              type: { type: 'string' },
-              metadata: { type: 'string' },
-            },
-          },
+          name: 'get_system_summary',
+          description: 'High-density snapshot of the OpenHAB system: items, things, rooms, health.',
+          inputSchema: { type: 'object', properties: {} },
         },
         {
-          name: 'get_item',
-          description: 'Get a specific item by name',
+          name: 'generate_home_blueprint',
+          description:
+            'Full room-by-room Markdown guide of the home. Use for layout exploration or when a user explicitly asks for a home overview — NOT as a first step (use initial_discovery instead).',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'resolve_item',
+          description:
+            'PRIMARY item finder. Converts natural-language intent ("kitchen light", "front door sensor") into ranked matches with exact names, types, rooms, and live states. Call this BEFORE any other search.',
           inputSchema: {
             type: 'object',
-            properties: { itemName: { type: 'string' } },
-            required: ['itemName'],
+            properties: { query: { type: 'string' } },
+            required: ['query'],
           },
         },
         {
           name: 'send_command',
-          description: 'Send a command (ON, OFF, 50, etc.) to an item',
+          description: 'Send a command (ON, OFF, numeric value, etc.) to a single item.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -48,333 +48,9 @@ export function registerTools(server: Server, client: OpenHabClient) {
           },
         },
         {
-          name: 'update_state',
-          description: 'Update the state of an item',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              itemName: { type: 'string' },
-              state: { type: 'string' },
-            },
-            required: ['itemName', 'state'],
-          },
-        },
-        {
-          name: 'create_or_update_item',
-          description: 'Create or update an item definition (managed mode)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              itemName: { type: 'string' },
-              itemData: { type: 'object' },
-            },
-            required: ['itemName', 'itemData'],
-          },
-        },
-        {
-          name: 'delete_item',
-          description: 'Delete an item',
-          inputSchema: {
-            type: 'object',
-            properties: { itemName: { type: 'string' } },
-            required: ['itemName'],
-          },
-        },
-
-        // --- Item Modifications (Consolidated) ---
-        {
-          name: 'manage_item_tag',
-          description: 'Add or remove a tag from an item',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              itemName: { type: 'string' },
-              tag: { type: 'string' },
-              action: { type: 'string', enum: ['add', 'remove'] },
-            },
-            required: ['itemName', 'tag', 'action'],
-          },
-        },
-        {
-          name: 'manage_item_metadata',
-          description: 'Set or remove metadata on an item',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              itemName: { type: 'string' },
-              namespace: { type: 'string' },
-              value: { type: 'string' },
-              config: { type: 'object' },
-              action: { type: 'string', enum: ['set', 'remove'] },
-            },
-            required: ['itemName', 'namespace', 'action'],
-          },
-        },
-
-        // --- Hardware & Things (Consolidated) ---
-        {
-          name: 'get_things',
-          description: 'Get all things',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'get_thing',
-          description: 'Get a specific thing by UID',
-          inputSchema: {
-            type: 'object',
-            properties: { thingUID: { type: 'string' } },
-            required: ['thingUID'],
-          },
-        },
-        {
-          name: 'manage_thing',
-          description: 'Lifecycle and config management for things',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['create', 'update', 'delete', 'enable', 'disable', 'configure'] },
-              thingUID: { type: 'string', description: 'Required for all actions except create' },
-              thingData: { type: 'object', description: 'Used for create/update' },
-              config: { type: 'object', description: 'Used for configure' },
-              force: { type: 'boolean', description: 'Used for delete' },
-            },
-            required: ['action'],
-          },
-        },
-        {
-          name: 'get_thing_status',
-          description: 'Get status of a thing',
-          inputSchema: {
-            type: 'object',
-            properties: { thingUID: { type: 'string' } },
-            required: ['thingUID'],
-          },
-        },
-
-        // --- Rules & Automation (Consolidated) ---
-        {
-          name: 'get_rules',
-          description: 'Get all rules',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'get_rule',
-          description: 'Get a rule by UID',
-          inputSchema: {
-            type: 'object',
-            properties: { ruleUID: { type: 'string' } },
-            required: ['ruleUID'],
-          },
-        },
-        {
-          name: 'manage_rule',
-          description: 'Lifecycle and execution management for rules',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['create', 'update', 'delete', 'enable', 'disable', 'run'] },
-              ruleUID: { type: 'string', description: 'Required for all actions except create' },
-              ruleData: { type: 'object', description: 'Used for create/update' },
-              enable: { type: 'boolean', description: 'Used for enable/disable' },
-            },
-            required: ['action'],
-          },
-        },
-
-        // --- Semantic Model (Consolidated) ---
-        {
-          name: 'manage_semantic_tag',
-          description: 'Create, update or delete semantic tags',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['create', 'update', 'delete'] },
-              tagId: { type: 'string' },
-              tagData: { type: 'object' },
-            },
-            required: ['action'],
-          },
-        },
-        {
-          name: 'manage_link',
-          description: 'Manage links between items and channels',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['link', 'unlink', 'configure'] },
-              itemName: { type: 'string' },
-              channelUID: { type: 'string' },
-              config: { type: 'object' },
-              profile: { type: 'string', description: 'Used for configure' },
-              profileConfig: { type: 'object', description: 'Used for configure' },
-            },
-            required: ['action', 'itemName', 'channelUID'],
-          },
-        },
-        {
-          name: 'get_semantic_tags',
-          description: 'Get all semantic tags',
-          inputSchema: { type: 'object', properties: {} },
-        },
-
-        // --- System Management (Consolidated) ---
-        {
-          name: 'get_audio_info',
-          description: 'Get info about audio sinks, sources, or voices',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              type: { type: 'string', enum: ['sinks', 'sources', 'voices'] },
-            },
-            required: ['type'],
-          },
-        },
-        {
-          name: 'voice_say',
-          description: 'Speak text via TTS',
-          inputSchema: {
-            type: 'object',
-            properties: { text: { type: 'string' }, sinkId: { type: 'string' } },
-            required: ['text'],
-          },
-        },
-        {
-          name: 'voice_interpret',
-          description: 'Interpret a natural language string',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              text: { type: 'string' },
-              interpreterIds: { type: 'string' },
-            },
-            required: ['text'],
-          },
-        },
-        {
-          name: 'manage_addon',
-          description: 'Install or uninstall an addon',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              addonId: { type: 'string' },
-              action: { type: 'string', enum: ['install', 'uninstall'] },
-            },
-            required: ['addonId', 'action'],
-          },
-        },
-        {
-          name: 'manage_inbox',
-          description: 'Approve or ignore discovered things in the inbox',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['approve', 'ignore', 'unignore'] },
-              thingUID: { type: 'string' },
-              label: { type: 'string' },
-              newThingId: { type: 'string' },
-            },
-            required: ['action', 'thingUID'],
-          },
-        },
-
-        // --- Configuration & Services (Consolidated) ---
-        {
-          name: 'get_system_registry',
-          description: 'Get lists from system registries (services, loggers, transformations, templates)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              type: { type: 'string', enum: ['services', 'loggers', 'transformations', 'templates'] },
-            },
-            required: ['type'],
-          },
-        },
-        {
-          name: 'manage_service_config',
-          description: 'Get or update configuration for a specific service',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              serviceId: { type: 'string' },
-              action: { type: 'string', enum: ['get', 'update'] },
-              config: { type: 'object' },
-            },
-            required: ['serviceId', 'action'],
-          },
-        },
-        {
-          name: 'manage_logger',
-          description: 'Get all loggers or set log level',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['list', 'set'] },
-              loggerName: { type: 'string' },
-              level: { type: 'string' },
-            },
-            required: ['action'],
-          },
-        },
-        {
-          name: 'get_system_info',
-          description: 'Get system information',
-          inputSchema: { type: 'object', properties: {} },
-        },
-
-        {
-          name: 'initial_discovery',
-          description: 'One-shot bootstrap to get system context and full schema at once',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'search_items',
-          description: 'Broad fuzzy search for items by name, label, tags, or groups',
-          inputSchema: {
-            type: 'object',
-            properties: { query: { type: 'string' } },
-            required: ['query'],
-          },
-        },
-        {
-          name: 'master_search',
-          description: 'Unified search across items, things, and rules in one call',
-          inputSchema: {
-            type: 'object',
-            properties: { query: { type: 'string' } },
-            required: ['query'],
-          },
-        },
-        {
-          name: 'get_room_inventory',
-          description: 'Get all equipment and items in a specific room (e.g. "Kitchen")',
-          inputSchema: {
-            type: 'object',
-            properties: { roomName: { type: 'string' } },
-            required: ['roomName'],
-          },
-        },
-        {
-          name: 'analyze_system_health',
-          description: 'Scan for hardware issues and battery levels',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'generate_topology',
-          description: 'Generate Mermaid topology graph',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'explain_item_state',
-          description: 'Forensic review of an item status and history',
-          inputSchema: {
-            type: 'object',
-            properties: { itemName: { type: 'string' } },
-            required: ['itemName'],
-          },
-        },
-        {
           name: 'execute_batch',
-          description: 'Execute multiple commands in parallel',
+          description:
+            'Execute multiple commands in parallel. Use for "Goodnight", scene-like, or multi-device actions.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -382,8 +58,12 @@ export function registerTools(server: Server, client: OpenHabClient) {
                 type: 'array',
                 items: {
                   type: 'object',
-                  properties: { itemName: { type: 'string' }, command: { type: 'string' } },
-                  required: ['itemName', 'command'],
+                  properties: {
+                    itemName: { type: 'string' },
+                    command: { type: 'string', description: 'Send command (preferred)' },
+                    state: { type: 'string', description: 'Direct state update (use when needed)' },
+                  },
+                  required: ['itemName'],
                 },
               },
             },
@@ -391,190 +71,515 @@ export function registerTools(server: Server, client: OpenHabClient) {
           },
         },
         {
-          name: 'capture_scene',
-          description: 'Capture current item states as a scene',
-          inputSchema: {
-            type: 'object',
-            properties: { name: { type: 'string' }, itemNames: { type: 'array', items: { type: 'string' } } },
-            required: ['name', 'itemNames'],
-          },
-        },
-        {
-          name: 'activate_scene',
-          description: 'Restore a named scene',
-          inputSchema: {
-            type: 'object',
-            properties: { name: { type: 'string' } },
-            required: ['name'],
-          },
-        },
-        {
-          name: 'get_prompt_context',
-          description: 'Get condensed system state for AI priming',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'get_recent_logs',
-          description: 'Fetch the recent event stream buffer (last 100 events)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              lines: { type: 'number' },
-            },
-          },
-        },
-        {
-          name: 'get_historical_logs',
-          description: 'Fetch a larger window of historical log events for deep review (up to 5000 lines)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              lines: { type: 'number', description: 'Number of lines to return (max 5000)' },
-              search: { type: 'string', description: 'Optional text filter' },
-            },
-          },
-        },
-        {
-          name: 'get_mcp_health',
-          description: 'Get real-time health metrics for the MCP server (SSE status, cache, buffer)',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'get_mcp_capabilities',
-          description: 'List all active advanced mastery capabilities of this MCP',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'summarize_persistence_range',
-          description: 'Get a statistical summary of an item over a time range (peakes, averages, trends)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              itemName: { type: 'string' },
-              startTime: { type: 'string', description: 'ISO8601 start time' },
-              endTime: { type: 'string', description: 'ISO8601 end time' },
-            },
-            required: ['itemName', 'startTime', 'endTime'],
-          },
-        },
-        {
-          name: 'simulate_system_state',
-          description: 'Predict the outcome of a command including potential rule trigger chains',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              itemName: { type: 'string' },
-              command: { type: 'string' },
-            },
-            required: ['itemName', 'command'],
-          },
-        },
-        {
-          name: 'generate_home_blueprint',
-          description: 'Generate a comprehensive Markdown guide of the entire home system',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'audit_system_safety',
-          description: 'Security audit of items tagged with Security/Safety',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'calculate_energy_insights',
-          description: 'Aggregate energy consumption across the home',
-          inputSchema: { type: 'object', properties: {} },
-        },
-        {
-          name: 'get_semantic_path',
-          description: 'Get the full semantic location path for an item',
-          inputSchema: {
-            type: 'object',
-            properties: { itemName: { type: 'string' } },
-            required: ['itemName'],
-          },
-        },
-        {
-          name: 'find_neighboring_equipment',
-          description: 'Find other equipment in the same location as the target item',
-          inputSchema: {
-            type: 'object',
-            properties: { itemName: { type: 'string' } },
-            required: ['itemName'],
-          },
-        },
-        {
           name: 'schedule_command',
-          description: 'Schedule a command for the future',
+          description: 'Schedule a command to run after a delay (e.g. "turn off in 20 minutes").',
           inputSchema: {
             type: 'object',
             properties: {
               itemName: { type: 'string' },
               command: { type: 'string' },
-              delayMs: { type: 'number' },
+              delayMs: { type: 'number', description: 'Delay in milliseconds' },
             },
             required: ['itemName', 'command', 'delayMs'],
           },
         },
+
+        // ─── Tier 2: Query / Read ─────────────────────────────────────────────
         {
-          name: 'get_stale_items',
-          description: 'Identify sensors that haven\'t updated in a while',
+          name: 'query_items',
+          description:
+            'Read item data. action: all (list with optional filters), get (by name), multi (batch by names), search (fuzzy text), master_search (across items+things+rules), room_inventory, semantic_path, neighbors, schema.',
           inputSchema: {
             type: 'object',
             properties: {
-              days: { type: 'number', description: 'Staleness threshold in days' },
+              action: {
+                type: 'string',
+                enum: [
+                  'all',
+                  'get',
+                  'multi',
+                  'search',
+                  'master_search',
+                  'room_inventory',
+                  'semantic_path',
+                  'neighbors',
+                  'schema',
+                ],
+              },
+              itemName: { type: 'string', description: 'Used by: get, semantic_path, neighbors' },
+              itemNames: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Used by: multi',
+              },
+              query: { type: 'string', description: 'Used by: search, master_search' },
+              roomName: { type: 'string', description: 'Used by: room_inventory' },
+              tags: { type: 'string', description: 'Comma-separated tag filter (used by: all)' },
+              type: { type: 'string', description: 'Item type filter (used by: all)' },
+              state: { type: 'string', description: 'State equality filter (used by: all)' },
+              includeMetadata: {
+                type: 'boolean',
+                description: 'Include full metadata in results (used by: all). Default false to reduce token usage.',
+              },
             },
+            required: ['action'],
           },
         },
         {
-          name: 'trigger_discovery_scan',
-          description: 'Trigger a manual hardware scan for a binding',
+          name: 'query_things',
+          description:
+            'Read thing data. action: all (list all), get (by UID), status (status info).',
           inputSchema: {
             type: 'object',
             properties: {
-              bindingId: { type: 'string', description: 'e.g., hue, sonos' },
+              action: { type: 'string', enum: ['all', 'get', 'status'] },
+              thingUID: { type: 'string', description: 'Used by: get, status' },
             },
-            required: ['bindingId'],
+            required: ['action'],
           },
         },
         {
-          name: 'chat_with_habot',
-          description: 'Send a natural language query to Habot',
+          name: 'query_rules',
+          description: 'Read automation rules. action: all (list all), get (by UID).',
           inputSchema: {
             type: 'object',
-            properties: { text: { type: 'string' } },
-            required: ['text'],
+            properties: {
+              action: { type: 'string', enum: ['all', 'get'] },
+              ruleUID: { type: 'string', description: 'Used by: get' },
+            },
+            required: ['action'],
+          },
+        },
+
+        // ─── Tier 3: CRUD Management ──────────────────────────────────────────
+        {
+          name: 'manage_item',
+          description:
+            'Modify items. action: create_or_update, delete, update_state, add_tag, remove_tag, set_metadata, remove_metadata.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: [
+                  'create_or_update',
+                  'delete',
+                  'update_state',
+                  'add_tag',
+                  'remove_tag',
+                  'set_metadata',
+                  'remove_metadata',
+                ],
+              },
+              itemName: { type: 'string' },
+              itemData: { type: 'object', description: 'Used by: create_or_update' },
+              state: { type: 'string', description: 'Used by: update_state' },
+              tag: { type: 'string', description: 'Used by: add_tag, remove_tag' },
+              namespace: { type: 'string', description: 'Used by: set_metadata, remove_metadata' },
+              value: { type: 'string', description: 'Used by: set_metadata' },
+              config: { type: 'object', description: 'Used by: set_metadata' },
+            },
+            required: ['action', 'itemName'],
+          },
+        },
+        {
+          name: 'manage_thing',
+          description: 'Manage things. action: create, update, delete, enable, disable, configure.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: ['create', 'update', 'delete', 'enable', 'disable', 'configure'],
+              },
+              thingUID: { type: 'string', description: 'Required for all except create' },
+              thingData: { type: 'object', description: 'Used by: create, update' },
+              config: { type: 'object', description: 'Used by: configure' },
+              force: { type: 'boolean', description: 'Used by: delete' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'manage_rule',
+          description:
+            'Manage automation rules. action: create, update, delete, enable, disable, run.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: ['create', 'update', 'delete', 'enable', 'disable', 'run'],
+              },
+              ruleUID: { type: 'string', description: 'Required for all except create' },
+              ruleData: { type: 'object', description: 'Used by: create, update' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'manage_link',
+          description:
+            'Manage item-channel links. action: list, link, unlink, configure (apply a link profile).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['list', 'link', 'unlink', 'configure'] },
+              itemName: { type: 'string', description: 'Required for: link, unlink, configure' },
+              channelUID: { type: 'string', description: 'Required for: link, unlink, configure' },
+              config: { type: 'object', description: 'Used by: link' },
+              profile: { type: 'string', description: 'Used by: configure' },
+              profileConfig: { type: 'object', description: 'Used by: configure' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'manage_scene',
+          description:
+            'Named scene management. action: capture (save current item states), activate (restore a saved scene).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['capture', 'activate'] },
+              name: { type: 'string', description: 'Scene name' },
+              itemNames: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Used by: capture',
+              },
+            },
+            required: ['action', 'name'],
+          },
+        },
+
+        // ─── Tier 4: System Services ──────────────────────────────────────────
+        {
+          name: 'manage_logs',
+          description:
+            'OpenHAB log access. Logs are on the remote OpenHAB server — ask the user for the path and call set_folder first. action: set_folder, recent, historical, search.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['set_folder', 'recent', 'historical', 'search'] },
+              folderPath: { type: 'string', description: 'Used by: set_folder' },
+              lines: { type: 'number', description: 'Used by: recent, historical' },
+              search: { type: 'string', description: 'Text filter (used by: historical)' },
+              query: { type: 'string', description: 'Used by: search' },
+              logType: {
+                type: 'string',
+                enum: ['openhab', 'events'],
+                description: 'Used by: search',
+              },
+              maxResults: { type: 'number', description: 'Used by: search' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'manage_persistence',
+          description:
+            'Persistence data operations. action: services (list), get_data, store_data, statistics, summarize.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: ['services', 'get_data', 'store_data', 'statistics', 'summarize'],
+              },
+              itemName: {
+                type: 'string',
+                description: 'Used by: get_data, store_data, statistics, summarize',
+              },
+              serviceId: {
+                type: 'string',
+                description: 'Persistence service ID (omit for default)',
+              },
+              starttime: { type: 'string', description: 'ISO8601 start time' },
+              endtime: { type: 'string', description: 'ISO8601 end time' },
+              time: { type: 'string', description: 'ISO8601 timestamp (used by: store_data)' },
+              state: { type: 'string', description: 'State value to store (used by: store_data)' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'manage_ui',
+          description:
+            'UI, add-ons, sitemaps, semantic tags, and discovery inbox. action: addons, install_addon, uninstall_addon, sitemaps, sitemap_to_main_ui, ui_components, ui_tiles, generate_widget, semantic_tags, create_tag, update_tag, delete_tag, inbox_list, inbox_approve, inbox_ignore, inbox_unignore.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: [
+                  'addons',
+                  'install_addon',
+                  'uninstall_addon',
+                  'sitemaps',
+                  'sitemap_to_main_ui',
+                  'ui_components',
+                  'ui_tiles',
+                  'generate_widget',
+                  'semantic_tags',
+                  'create_tag',
+                  'update_tag',
+                  'delete_tag',
+                  'inbox_list',
+                  'inbox_approve',
+                  'inbox_ignore',
+                  'inbox_unignore',
+                ],
+              },
+              addonId: { type: 'string', description: 'Used by: install_addon, uninstall_addon' },
+              namespace: { type: 'string', description: 'Used by: ui_components (e.g. ui:pages)' },
+              itemName: { type: 'string', description: 'Used by: generate_widget' },
+              sitemapName: { type: 'string', description: 'Used by: sitemap_to_main_ui' },
+              tagId: { type: 'string', description: 'Used by: update_tag, delete_tag' },
+              tagData: { type: 'object', description: 'Used by: create_tag, update_tag' },
+              thingUID: {
+                type: 'string',
+                description: 'Used by: inbox_approve, inbox_ignore, inbox_unignore',
+              },
+              label: { type: 'string', description: 'Used by: inbox_approve' },
+              newThingId: { type: 'string', description: 'Used by: inbox_approve' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'manage_system',
+          description:
+            'System config, loggers, voice/audio, and binding scans. action: system_info, services, service_config_get, service_config_update, logger_list, logger_set, transformations, templates, trigger_scan, voice_say, voice_interpret, voices, audio_sinks, audio_sources, habot.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: [
+                  'system_info',
+                  'services',
+                  'service_config_get',
+                  'service_config_update',
+                  'logger_list',
+                  'logger_set',
+                  'transformations',
+                  'templates',
+                  'trigger_scan',
+                  'voice_say',
+                  'voice_interpret',
+                  'voices',
+                  'audio_sinks',
+                  'audio_sources',
+                  'habot',
+                ],
+              },
+              serviceId: {
+                type: 'string',
+                description: 'Used by: service_config_get, service_config_update',
+              },
+              config: { type: 'object', description: 'Used by: service_config_update' },
+              loggerName: { type: 'string', description: 'Used by: logger_set' },
+              level: { type: 'string', description: 'Used by: logger_set' },
+              bindingId: { type: 'string', description: 'Used by: trigger_scan (e.g. hue, sonos)' },
+              text: { type: 'string', description: 'Used by: voice_say, voice_interpret, habot' },
+              sinkId: { type: 'string', description: 'Used by: voice_say' },
+              interpreterIds: { type: 'string', description: 'Used by: voice_interpret' },
+            },
+            required: ['action'],
+          },
+        },
+
+        // ─── Tier 5: Intelligence & Analysis ──────────────────────────────────
+        {
+          name: 'analyze_home',
+          description:
+            'Home-wide analysis. action: health (offline + battery), safety_audit, energy, stale_items, orphans (broken links), semantic_audit (model gaps), rule_conflicts, find_equipment (by room + type), voice_exposure (Google/Alexa mappings).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: [
+                  'health',
+                  'safety_audit',
+                  'energy',
+                  'stale_items',
+                  'orphans',
+                  'semantic_audit',
+                  'rule_conflicts',
+                  'find_equipment',
+                  'voice_exposure',
+                ],
+              },
+              days: {
+                type: 'number',
+                description: 'Staleness threshold in days (used by: stale_items)',
+              },
+              roomName: { type: 'string', description: 'Used by: find_equipment' },
+              equipmentType: {
+                type: 'string',
+                description: 'Semantic keyword e.g. Light, Lock (used by: find_equipment)',
+              },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'diagnose_item',
+          description:
+            'Item diagnostics. action: explain (forensic state + rules + history), topology (Mermaid home graph).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['explain', 'topology'] },
+              itemName: { type: 'string', description: 'Required for: explain' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'automation',
+          description:
+            'Automation generation and testing. action: generate_rule (from NL), discover_patterns (temporal correlation), shadow_run (dry-run preview), simulate (predict outcome + rule chains), validate_rule (JS syntax check).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: [
+                  'generate_rule',
+                  'discover_patterns',
+                  'shadow_run',
+                  'simulate',
+                  'validate_rule',
+                ],
+              },
+              intent: {
+                type: 'string',
+                description: 'Natural language rule intent (used by: generate_rule)',
+              },
+              itemName: { type: 'string', description: 'Used by: simulate, discover_patterns' },
+              correlatedItemName: { type: 'string', description: 'Used by: discover_patterns' },
+              command: { type: 'string', description: 'Used by: simulate' },
+              commands: {
+                type: 'array',
+                description: 'Used by: shadow_run',
+                items: {
+                  type: 'object',
+                  properties: { itemName: { type: 'string' }, command: { type: 'string' } },
+                  required: ['itemName', 'command'],
+                },
+              },
+              script: { type: 'string', description: 'JS to validate (used by: validate_rule)' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'remediate',
+          description:
+            'Bulk remediation and generation. action: bulk_update (batch tags/groups), create_equipment (auto-provision from thing), suggest_tags, standardize_naming, optimize_persistence, export_snapshot, boilerplate (TS types).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: {
+                type: 'string',
+                enum: [
+                  'bulk_update',
+                  'create_equipment',
+                  'suggest_tags',
+                  'standardize_naming',
+                  'optimize_persistence',
+                  'export_snapshot',
+                  'boilerplate',
+                ],
+              },
+              itemNames: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Used by: bulk_update',
+              },
+              updates: {
+                type: 'object',
+                description: 'Used by: bulk_update',
+                properties: {
+                  tags: { type: 'array', items: { type: 'string' } },
+                  category: { type: 'string' },
+                  groupNames: { type: 'array', items: { type: 'string' } },
+                },
+              },
+              thingUID: { type: 'string', description: 'Used by: create_equipment' },
+              roomGroup: {
+                type: 'string',
+                description: 'Target location group (used by: create_equipment)',
+              },
+              itemName: { type: 'string', description: 'Used by: suggest_tags' },
+            },
+            required: ['action'],
+          },
+        },
+        {
+          name: 'control_media',
+          description:
+            'Control a media player equipment item. action: play, pause, next, previous, volume_up, volume_down.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              equipmentName: {
+                type: 'string',
+                description: 'Name or label of the media player equipment group',
+              },
+              action: {
+                type: 'string',
+                enum: ['play', 'pause', 'next', 'previous', 'volume_up', 'volume_down'],
+              },
+            },
+            required: ['equipmentName', 'action'],
+          },
+        },
+        {
+          name: 'mcp_status',
+          description:
+            'MCP server metadata. action: health (SSE/cache metrics), capabilities, prompt_context (AI priming context for this home).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['health', 'capabilities', 'prompt_context'] },
+            },
+            required: ['action'],
           },
         },
       ],
     };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
     try {
       let result: unknown;
+
       switch (name) {
-        // --- Core Items ---
+        // ─── Core standalone ──────────────────────────────────────────────────
+        case 'initial_discovery':
+          result = await client.initialDiscovery();
+          break;
+
         case 'get_system_summary':
           result = await client.getSystemSummary();
           break;
-        case 'get_items': {
-          const { tags, type, metadata } = z
-            .object({
-              tags: z.string().optional(),
-              type: z.string().optional(),
-              metadata: z.string().optional(),
-            })
-            .parse(args);
-          result = await client.getItems(tags, type, metadata);
+
+        case 'generate_home_blueprint':
+          result = await client.generateHomeBlueprint();
+          break;
+
+        case 'resolve_item': {
+          const { query } = z.object({ query: z.string() }).parse(args);
+          result = await client.resolveItem(query);
           break;
         }
-        case 'get_item': {
-          const { itemName } = z.object({ itemName: z.string() }).parse(args);
-          result = await client.getItem(itemName);
-          break;
-        }
+
         case 'send_command': {
           const { itemName, command } = z
             .object({ itemName: z.string(), command: z.string() })
@@ -582,57 +587,175 @@ export function registerTools(server: Server, client: OpenHabClient) {
           result = await client.sendCommand(itemName, command);
           break;
         }
-        case 'update_state': {
-          const { itemName, state } = z
-            .object({ itemName: z.string(), state: z.string() })
-            .parse(args);
-          result = await client.updateState(itemName, state);
-          break;
-        }
-        case 'create_or_update_item': {
-          const { itemName, itemData } = z
-            .object({ itemName: z.string(), itemData: z.record(z.string(), z.any()) })
-            .parse(args);
-          result = await client.createOrUpdateItem(itemName, itemData);
-          break;
-        }
-        case 'delete_item': {
-          const { itemName } = z.object({ itemName: z.string() }).parse(args);
-          result = await client.deleteItem(itemName);
-          break;
-        }
 
-        // --- Item Modifications (Consolidated) ---
-        case 'manage_item_tag': {
-          const { itemName, tag, action } = z
-            .object({ itemName: z.string(), tag: z.string(), action: z.enum(['add', 'remove']) })
-            .parse(args);
-          result = action === 'add' ? await client.addTag(itemName, tag) : await client.removeTag(itemName, tag);
-          break;
-        }
-        case 'manage_item_metadata': {
-          const { itemName, namespace, value, config, action } = z
+        case 'execute_batch': {
+          const { commands } = z
             .object({
-              itemName: z.string(),
-              namespace: z.string(),
-              value: z.string().optional(),
-              config: z.record(z.string(), z.any()).optional(),
-              action: z.enum(['set', 'remove']),
+              commands: z.array(
+                z.object({
+                  itemName: z.string(),
+                  command: z.string().optional(),
+                  state: z.string().optional(),
+                })
+              ),
             })
             .parse(args);
-          result = action === 'set' ? await client.setMetadata(itemName, namespace, value!, config) : await client.removeMetadata(itemName, namespace);
+          result = await client.executeBatch(commands);
           break;
         }
 
-        // --- Hardware & Things (Consolidated) ---
-        case 'get_things':
-          result = await client.getThings();
-          break;
-        case 'get_thing': {
-          const { thingUID } = z.object({ thingUID: z.string() }).parse(args);
-          result = await client.getThing(thingUID);
+        case 'schedule_command': {
+          const { itemName, command, delayMs } = z
+            .object({ itemName: z.string(), command: z.string(), delayMs: z.number() })
+            .parse(args);
+          result = await client.scheduleCommand(itemName, command, delayMs);
           break;
         }
+
+        // ─── Query / Read ──────────────────────────────────────────────────────
+        case 'query_items': {
+          const parsed = z
+            .object({
+              action: z.enum([
+                'all',
+                'get',
+                'multi',
+                'search',
+                'master_search',
+                'room_inventory',
+                'semantic_path',
+                'neighbors',
+                'schema',
+              ]),
+              itemName: z.string().optional(),
+              itemNames: z.array(z.string()).optional(),
+              query: z.string().optional(),
+              roomName: z.string().optional(),
+              tags: z.string().optional(),
+              type: z.string().optional(),
+              state: z.string().optional(),
+              includeMetadata: z.boolean().optional(),
+            })
+            .parse(args);
+
+          switch (parsed.action) {
+            case 'all':
+              // Pass includeMetadata down to getItems so the fetch is slim by default.
+              // getItems() only requests metadata from the OpenHAB API when explicitly needed,
+              // so this controls both the network payload AND the cached response size.
+              result = await client.getItems(
+                parsed.tags,
+                parsed.type,
+                parsed.includeMetadata ? '.*' : undefined,
+                parsed.state
+              );
+              break;
+            case 'get':
+              result = await client.getItem(parsed.itemName!);
+              break;
+            case 'multi':
+              result = await client.getMultiItems(parsed.itemNames!);
+              break;
+            case 'search':
+              result = await client.searchItems(parsed.query!);
+              break;
+            case 'master_search':
+              result = await client.masterSearch(parsed.query!);
+              break;
+            case 'room_inventory':
+              result = await client.getRoomInventory(parsed.roomName!);
+              break;
+            case 'semantic_path':
+              result = await client.getSemanticPath(parsed.itemName!);
+              break;
+            case 'neighbors':
+              result = await client.findNeighboringEquipment(parsed.itemName!);
+              break;
+            case 'schema':
+              result = await client.getSchema();
+              break;
+          }
+          break;
+        }
+
+        case 'query_things': {
+          const { action, thingUID } = z
+            .object({
+              action: z.enum(['all', 'get', 'status']),
+              thingUID: z.string().optional(),
+            })
+            .parse(args);
+          if (action === 'all') result = await client.getThings();
+          else if (action === 'get') result = await client.getThing(thingUID!);
+          else result = await client.getThingStatus(thingUID!);
+          break;
+        }
+
+        case 'query_rules': {
+          const { action, ruleUID } = z
+            .object({
+              action: z.enum(['all', 'get']),
+              ruleUID: z.string().optional(),
+            })
+            .parse(args);
+          result = action === 'all' ? await client.getRules() : await client.getRule(ruleUID!);
+          break;
+        }
+
+        // ─── CRUD Management ───────────────────────────────────────────────────
+        case 'manage_item': {
+          const parsed = z
+            .object({
+              action: z.enum([
+                'create_or_update',
+                'delete',
+                'update_state',
+                'add_tag',
+                'remove_tag',
+                'set_metadata',
+                'remove_metadata',
+              ]),
+              itemName: z.string(),
+              itemData: z.record(z.string(), z.any()).optional(),
+              state: z.string().optional(),
+              tag: z.string().optional(),
+              namespace: z.string().optional(),
+              value: z.string().optional(),
+              config: z.record(z.string(), z.any()).optional(),
+            })
+            .parse(args);
+
+          switch (parsed.action) {
+            case 'create_or_update':
+              result = await client.createOrUpdateItem(parsed.itemName, parsed.itemData!);
+              break;
+            case 'delete':
+              result = await client.deleteItem(parsed.itemName);
+              break;
+            case 'update_state':
+              result = await client.updateState(parsed.itemName, parsed.state!);
+              break;
+            case 'add_tag':
+              result = await client.addTag(parsed.itemName, parsed.tag!);
+              break;
+            case 'remove_tag':
+              result = await client.removeTag(parsed.itemName, parsed.tag!);
+              break;
+            case 'set_metadata':
+              result = await client.setMetadata(
+                parsed.itemName,
+                parsed.namespace!,
+                parsed.value!,
+                parsed.config
+              );
+              break;
+            case 'remove_metadata':
+              result = await client.removeMetadata(parsed.itemName, parsed.namespace!);
+              break;
+          }
+          break;
+        }
+
         case 'manage_thing': {
           const { action, thingUID, thingData, config, force } = z
             .object({
@@ -645,274 +768,541 @@ export function registerTools(server: Server, client: OpenHabClient) {
             .parse(args);
 
           switch (action) {
-            case 'create': result = await client.createThing(thingData!); break;
-            case 'update': result = await client.updateThing(thingUID!, thingData!); break;
-            case 'delete': result = await client.deleteThing(thingUID!, force); break;
-            case 'enable': result = await client.enableThing(thingUID!, true); break;
-            case 'disable': result = await client.enableThing(thingUID!, false); break;
-            case 'configure': result = await client.updateThingConfig(thingUID!, config!); break;
+            case 'create':
+              result = await client.createThing(thingData!);
+              break;
+            case 'update':
+              result = await client.updateThing(thingUID!, thingData!);
+              break;
+            case 'delete':
+              result = await client.deleteThing(thingUID!, force);
+              break;
+            case 'enable':
+              result = await client.enableThing(thingUID!, true);
+              break;
+            case 'disable':
+              result = await client.enableThing(thingUID!, false);
+              break;
+            case 'configure':
+              result = await client.updateThingConfig(thingUID!, config!);
+              break;
           }
           break;
         }
-        case 'get_thing_status': {
-          const { thingUID } = z.object({ thingUID: z.string() }).parse(args);
-          result = await client.getThingStatus(thingUID);
-          break;
-        }
 
-        // --- Rules & Automation (Consolidated) ---
-        case 'get_rules':
-          result = await client.getRules();
-          break;
-        case 'get_rule': {
-          const { ruleUID } = z.object({ ruleUID: z.string() }).parse(args);
-          result = await client.getRule(ruleUID);
-          break;
-        }
         case 'manage_rule': {
-          const { action, ruleUID, ruleData, enable } = z
+          const { action, ruleUID, ruleData } = z
             .object({
               action: z.enum(['create', 'update', 'delete', 'enable', 'disable', 'run']),
               ruleUID: z.string().optional(),
               ruleData: z.record(z.string(), z.any()).optional(),
-              enable: z.boolean().optional(),
             })
             .parse(args);
 
           switch (action) {
-            case 'create': result = await client.createRule(ruleData!); break;
-            case 'update': result = await client.updateRule(ruleUID!, ruleData!); break;
-            case 'delete': result = await client.deleteRule(ruleUID!); break;
-            case 'enable': result = await client.enableRule(ruleUID!, true); break;
-            case 'disable': result = await client.enableRule(ruleUID!, false); break;
-            case 'run': result = await client.runRule(ruleUID!); break;
+            case 'create':
+              result = await client.createRule(ruleData!);
+              break;
+            case 'update':
+              result = await client.updateRule(ruleUID!, ruleData!);
+              break;
+            case 'delete':
+              result = await client.deleteRule(ruleUID!);
+              break;
+            case 'enable':
+              result = await client.enableRule(ruleUID!, true);
+              break;
+            case 'disable':
+              result = await client.enableRule(ruleUID!, false);
+              break;
+            case 'run':
+              result = await client.runRule(ruleUID!);
+              break;
           }
           break;
         }
 
-        // --- Semantic Model (Consolidated) ---
-        case 'manage_semantic_tag': {
-          const { action, tagId, tagData } = z
-            .object({
-              action: z.enum(['create', 'update', 'delete']),
-              tagId: z.string().optional(),
-              tagData: z.any().optional(),
-            })
-            .parse(args);
-          if (action === 'create') result = await client.createSemanticTag(tagData!);
-          else if (action === 'update') result = await client.updateSemanticTag(tagId!, tagData!);
-          else result = await client.deleteSemanticTag(tagId!);
-          break;
-        }
         case 'manage_link': {
           const { action, itemName, channelUID, config, profile, profileConfig } = z
             .object({
-              action: z.enum(['link', 'unlink', 'configure']),
-              itemName: z.string(),
-              channelUID: z.string(),
+              action: z.enum(['list', 'link', 'unlink', 'configure']),
+              itemName: z.string().optional(),
+              channelUID: z.string().optional(),
               config: z.record(z.string(), z.any()).optional(),
               profile: z.string().optional(),
               profileConfig: z.record(z.string(), z.any()).optional(),
             })
             .parse(args);
 
-          if (action === 'link') result = await client.linkItemToChannel(itemName, channelUID, config);
-          else if (action === 'unlink') result = await client.unlinkItemFromChannel(itemName, channelUID);
-          else result = await client.configureLinkProfile(itemName, channelUID, profile!, profileConfig);
+          if (action === 'list') result = await client.getLinks(itemName, channelUID);
+          else if (action === 'link')
+            result = await client.linkItemToChannel(itemName!, channelUID!, config);
+          else if (action === 'unlink')
+            result = await client.unlinkItemFromChannel(itemName!, channelUID!);
+          else
+            result = await client.configureLinkProfile(
+              itemName!,
+              channelUID!,
+              profile!,
+              profileConfig
+            );
           break;
         }
-        case 'get_semantic_tags':
-          result = await client.getSemanticTags();
-          break;
 
-        // --- System Management (Consolidated) ---
-        case 'get_audio_info': {
-          const { type } = z.object({ type: z.enum(['sinks', 'sources', 'voices']) }).parse(args);
-          if (type === 'sinks') result = await client.getAudioSinks();
-          else if (type === 'sources') result = await client.getAudioSources();
-          else result = await client.getVoices();
-          break;
-        }
-        case 'voice_say': {
-          const { text, sinkId } = z.object({ text: z.string(), sinkId: z.string().optional() }).parse(args);
-          result = await client.voiceSay(text, undefined, sinkId);
-          break;
-        }
-        case 'voice_interpret': {
-          const { text, interpreterIds } = z.object({ text: z.string(), interpreterIds: z.string().optional() }).parse(args);
-          result = await client.voiceInterpret(text, interpreterIds);
-          break;
-        }
-        case 'manage_addon': {
-          const { addonId, action } = z.object({ addonId: z.string(), action: z.enum(['install', 'uninstall']) }).parse(args);
-          result = action === 'install' ? await client.installAddon(addonId) : await client.uninstallAddon(addonId);
-          break;
-        }
-        case 'manage_inbox': {
-          const { action, thingUID, label, newThingId } = z
+        case 'manage_scene': {
+          const { action, name, itemNames } = z
             .object({
-              action: z.enum(['approve', 'ignore', 'unignore']),
-              thingUID: z.string(),
+              action: z.enum(['capture', 'activate']),
+              name: z.string(),
+              itemNames: z.array(z.string()).optional(),
+            })
+            .parse(args);
+          result =
+            action === 'capture'
+              ? await client.captureScene(name, itemNames!)
+              : await client.activateScene(name);
+          break;
+        }
+
+        // ─── System Services ───────────────────────────────────────────────────
+        case 'manage_logs': {
+          const parsed = z
+            .object({
+              action: z.enum(['set_folder', 'recent', 'historical', 'search']),
+              folderPath: z.string().optional(),
+              lines: z.number().optional(),
+              search: z.string().optional(),
+              query: z.string().optional(),
+              logType: z.enum(['openhab', 'events']).optional(),
+              maxResults: z.number().optional(),
+            })
+            .parse(args);
+
+          switch (parsed.action) {
+            case 'set_folder':
+              client.setLogFolderPath(parsed.folderPath!);
+              result = `Log folder path set to: ${parsed.folderPath}`;
+              break;
+            case 'recent':
+              result = await client.getRecentLogs(parsed.lines);
+              break;
+            case 'historical':
+              result = await client.getHistoricalLogs(parsed.lines, parsed.search);
+              break;
+            case 'search':
+              result = await client.searchLogs(
+                parsed.query!,
+                parsed.logType as 'openhab' | 'events',
+                parsed.maxResults
+              );
+              break;
+          }
+          break;
+        }
+
+        case 'manage_persistence': {
+          const parsed = z
+            .object({
+              action: z.enum(['services', 'get_data', 'store_data', 'statistics', 'summarize']),
+              itemName: z.string().optional(),
+              serviceId: z.string().optional(),
+              starttime: z.string().optional(),
+              endtime: z.string().optional(),
+              time: z.string().optional(),
+              state: z.string().optional(),
+            })
+            .parse(args);
+
+          switch (parsed.action) {
+            case 'services':
+              result = await client.getPersistenceServices();
+              break;
+            case 'get_data':
+              result = await client.getItemPersistenceData(
+                parsed.itemName!,
+                parsed.serviceId,
+                parsed.starttime,
+                parsed.endtime
+              );
+              break;
+            case 'store_data':
+              await client.storeItemPersistenceData(
+                parsed.itemName!,
+                parsed.time!,
+                parsed.state!,
+                parsed.serviceId
+              );
+              result = `Stored state '${parsed.state}' for '${parsed.itemName}' at ${parsed.time}.`;
+              break;
+            case 'statistics':
+              result = await client.getItemStatistics(
+                parsed.itemName!,
+                parsed.starttime,
+                parsed.endtime,
+                parsed.serviceId
+              );
+              break;
+            case 'summarize':
+              result = await client.summarizePersistenceRange(
+                parsed.itemName!,
+                parsed.starttime!,
+                parsed.endtime!
+              );
+              break;
+          }
+          break;
+        }
+
+        case 'manage_ui': {
+          const parsed = z
+            .object({
+              action: z.enum([
+                'addons',
+                'install_addon',
+                'uninstall_addon',
+                'sitemaps',
+                'sitemap_to_main_ui',
+                'ui_components',
+                'ui_tiles',
+                'generate_widget',
+                'semantic_tags',
+                'create_tag',
+                'update_tag',
+                'delete_tag',
+                'inbox_list',
+                'inbox_approve',
+                'inbox_ignore',
+                'inbox_unignore',
+              ]),
+              addonId: z.string().optional(),
+              namespace: z.string().optional(),
+              itemName: z.string().optional(),
+              sitemapName: z.string().optional(),
+              tagId: z.string().optional(),
+              tagData: z.any().optional(),
+              thingUID: z.string().optional(),
               label: z.string().optional(),
               newThingId: z.string().optional(),
             })
             .parse(args);
-          if (action === 'approve') result = await client.approveInboxItem(thingUID, label, newThingId);
-          else if (action === 'ignore') result = await client.ignoreInboxItem(thingUID);
-          else result = await client.unignoreInboxItem(thingUID);
+
+          switch (parsed.action) {
+            case 'addons':
+              result = await client.getAddons();
+              break;
+            case 'install_addon':
+              result = await client.installAddon(parsed.addonId!);
+              break;
+            case 'uninstall_addon':
+              result = await client.uninstallAddon(parsed.addonId!);
+              break;
+            case 'sitemaps':
+              result = await client.getSitemaps();
+              break;
+            case 'sitemap_to_main_ui':
+              result = await client.sitemapToMainUI(parsed.sitemapName!);
+              break;
+            case 'ui_components':
+              result = await client.getUIComponents(parsed.namespace!);
+              break;
+            case 'ui_tiles':
+              result = await client.getUITiles();
+              break;
+            case 'generate_widget':
+              result = await client.generateUIWidget(parsed.itemName!);
+              break;
+            case 'semantic_tags':
+              result = await client.getSemanticTags();
+              break;
+            case 'create_tag':
+              result = await client.createSemanticTag(parsed.tagData!);
+              break;
+            case 'update_tag':
+              result = await client.updateSemanticTag(parsed.tagId!, parsed.tagData!);
+              break;
+            case 'delete_tag':
+              result = await client.deleteSemanticTag(parsed.tagId!);
+              break;
+            case 'inbox_list':
+              result = await client.getInbox();
+              break;
+            case 'inbox_approve':
+              result = await client.approveInboxItem(
+                parsed.thingUID!,
+                parsed.label,
+                parsed.newThingId
+              );
+              break;
+            case 'inbox_ignore':
+              result = await client.ignoreInboxItem(parsed.thingUID!);
+              break;
+            case 'inbox_unignore':
+              result = await client.unignoreInboxItem(parsed.thingUID!);
+              break;
+          }
           break;
         }
 
-        // --- Configuration & Services (Consolidated) ---
-        case 'get_system_registry': {
-          const { type } = z.object({ type: z.enum(['services', 'loggers', 'transformations', 'templates']) }).parse(args);
-          if (type === 'services') result = await client.getServices();
-          else if (type === 'loggers') result = await client.getLoggers();
-          else if (type === 'transformations') result = await client.getTransformations();
-          else result = await client.getTemplates();
-          break;
-        }
-        case 'manage_service_config': {
-          const { serviceId, action, config } = z
+        case 'manage_system': {
+          const parsed = z
             .object({
-              serviceId: z.string(),
-              action: z.enum(['get', 'update']),
+              action: z.enum([
+                'system_info',
+                'services',
+                'service_config_get',
+                'service_config_update',
+                'logger_list',
+                'logger_set',
+                'transformations',
+                'templates',
+                'trigger_scan',
+                'voice_say',
+                'voice_interpret',
+                'voices',
+                'audio_sinks',
+                'audio_sources',
+                'habot',
+              ]),
+              serviceId: z.string().optional(),
               config: z.record(z.string(), z.any()).optional(),
-            })
-            .parse(args);
-          result = action === 'get' ? await client.getServiceConfig(serviceId) : await client.updateServiceConfig(serviceId, config!);
-          break;
-        }
-        case 'manage_logger': {
-          const { action, loggerName, level } = z
-            .object({
-              action: z.enum(['list', 'set']),
               loggerName: z.string().optional(),
               level: z.string().optional(),
+              bindingId: z.string().optional(),
+              text: z.string().optional(),
+              sinkId: z.string().optional(),
+              interpreterIds: z.string().optional(),
             })
             .parse(args);
-          result = action === 'list' ? await client.getLoggers() : await client.setLoggerLevel(loggerName!, level!);
-          break;
-        }
-        case 'get_system_info':
-          result = await client.getSystemInfo();
-          break;
 
-        // --- Advanced Mastery Tools ---
-        case 'initial_discovery':
-          result = await client.initialDiscovery();
-          break;
-        case 'search_items': {
-          const { query } = z.object({ query: z.string() }).parse(args);
-          result = await client.searchItems(query);
+          switch (parsed.action) {
+            case 'system_info':
+              result = await client.getSystemInfo();
+              break;
+            case 'services':
+              result = await client.getServices();
+              break;
+            case 'service_config_get':
+              result = await client.getServiceConfig(parsed.serviceId!);
+              break;
+            case 'service_config_update':
+              result = await client.updateServiceConfig(parsed.serviceId!, parsed.config!);
+              break;
+            case 'logger_list':
+              result = await client.getLoggers();
+              break;
+            case 'logger_set':
+              result = await client.setLoggerLevel(parsed.loggerName!, parsed.level!);
+              break;
+            case 'transformations':
+              result = await client.getTransformations();
+              break;
+            case 'templates':
+              result = await client.getTemplates();
+              break;
+            case 'trigger_scan':
+              result = await client.triggerDiscoveryScan(parsed.bindingId!);
+              break;
+            case 'voice_say':
+              result = await client.voiceSay(parsed.text!, undefined, parsed.sinkId);
+              break;
+            case 'voice_interpret':
+              result = await client.voiceInterpret(parsed.text!, parsed.interpreterIds);
+              break;
+            case 'voices':
+              result = await client.getVoices();
+              break;
+            case 'audio_sinks':
+              result = await client.getAudioSinks();
+              break;
+            case 'audio_sources':
+              result = await client.getAudioSources();
+              break;
+            case 'habot':
+              result = await client.chatWithHabot(parsed.text!);
+              break;
+          }
           break;
         }
-        case 'master_search': {
-          const { query } = z.object({ query: z.string() }).parse(args);
-          result = await client.masterSearch(query);
-          break;
-        }
-        case 'get_room_inventory': {
-          const { roomName } = z.object({ roomName: z.string() }).parse(args);
-          result = await client.getRoomInventory(roomName);
-          break;
-        }
-        case 'analyze_system_health':
-          result = await client.analyzeSystemHealth();
-          break;
-        case 'generate_topology':
-          result = await client.generateTopology();
-          break;
-        case 'explain_item_state': {
-          const { itemName } = z.object({ itemName: z.string() }).parse(args);
-          result = await client.explainItemState(itemName);
-          break;
-        }
-        case 'execute_batch': {
-          const { commands } = z
+
+        // ─── Intelligence & Analysis ───────────────────────────────────────────
+        case 'analyze_home': {
+          const parsed = z
             .object({
-              commands: z.array(z.object({ itemName: z.string(), command: z.string() })),
+              action: z.enum([
+                'health',
+                'safety_audit',
+                'energy',
+                'stale_items',
+                'orphans',
+                'semantic_audit',
+                'rule_conflicts',
+                'find_equipment',
+                'voice_exposure',
+              ]),
+              days: z.number().optional(),
+              roomName: z.string().optional(),
+              equipmentType: z.string().optional(),
             })
             .parse(args);
-          result = await client.executeBatch(commands);
+
+          switch (parsed.action) {
+            case 'health':
+              result = await client.analyzeSystemHealth();
+              break;
+            case 'safety_audit':
+              result = await client.auditSystemSafety();
+              break;
+            case 'energy':
+              result = await client.calculateEnergyInsights();
+              break;
+            case 'stale_items':
+              result = await client.getStaleItems(parsed.days);
+              break;
+            case 'orphans':
+              result = await client.findOrphansAndBrokenLinks();
+              break;
+            case 'semantic_audit':
+              result = await client.auditSemanticModel();
+              break;
+            case 'rule_conflicts':
+              result = await client.detectRuleConflicts();
+              break;
+            case 'find_equipment':
+              result = await client.findEquipmentByType(parsed.roomName!, parsed.equipmentType!);
+              break;
+            case 'voice_exposure':
+              result = await client.auditVoiceExposure();
+              break;
+          }
           break;
         }
-        case 'capture_scene': {
-          const { name, itemNames } = z.object({ name: z.string(), itemNames: z.array(z.string()) }).parse(args);
-          result = await client.captureScene(name, itemNames);
+
+        case 'diagnose_item': {
+          const { action, itemName } = z
+            .object({
+              action: z.enum(['explain', 'topology']),
+              itemName: z.string().optional(),
+            })
+            .parse(args);
+          result =
+            action === 'explain'
+              ? await client.explainItemState(itemName!)
+              : await client.generateTopology();
           break;
         }
-        case 'activate_scene': {
-          const { name } = z.object({ name: z.string() }).parse(args);
-          result = await client.activateScene(name);
+
+        case 'automation': {
+          const parsed = z
+            .object({
+              action: z.enum([
+                'generate_rule',
+                'discover_patterns',
+                'shadow_run',
+                'simulate',
+                'validate_rule',
+              ]),
+              intent: z.string().optional(),
+              itemName: z.string().optional(),
+              correlatedItemName: z.string().optional(),
+              command: z.string().optional(),
+              commands: z.array(z.object({ itemName: z.string(), command: z.string() })).optional(),
+              script: z.string().optional(),
+            })
+            .parse(args);
+
+          switch (parsed.action) {
+            case 'generate_rule':
+              result = await client.generateRuleFromNL(parsed.intent!);
+              break;
+            case 'discover_patterns':
+              result = await client.discoverAutomationPatterns(
+                parsed.itemName!,
+                parsed.correlatedItemName!
+              );
+              break;
+            case 'shadow_run':
+              result = await client.shadowRun(parsed.commands!);
+              break;
+            case 'simulate':
+              result = await client.simulateSystemState(parsed.itemName!, parsed.command!);
+              break;
+            case 'validate_rule':
+              result = await client.validateRuleLogic(parsed.script!, 'application/javascript');
+              break;
+          }
           break;
         }
-        case 'get_prompt_context':
-          result = await client.getPromptContext();
-          break;
-        case 'get_recent_logs': {
-          const { lines } = z.object({ lines: z.number().optional() }).parse(args);
-          result = await client.getRecentLogs(lines);
-          break;
-        }
-        case 'get_historical_logs': {
-          const { lines, search } = z.object({ lines: z.number().optional(), search: z.string().optional() }).parse(args);
-          result = await client.getHistoricalLogs(lines, search);
-          break;
-        }
-        case 'get_mcp_health':
-          result = client.getMcpHealth();
-          break;
-        case 'get_mcp_capabilities':
-          result = client.getMcpCapabilities();
-          break;
-        case 'summarize_persistence_range': {
-          const { itemName, startTime, endTime } = z.object({ itemName: z.string(), startTime: z.string(), endTime: z.string() }).parse(args);
-          result = await client.summarizePersistenceRange(itemName, startTime, endTime);
-          break;
-        }
-        case 'simulate_system_state': {
-          const { itemName, command } = z.object({ itemName: z.string(), command: z.string() }).parse(args);
-          result = await client.simulateSystemState(itemName, command);
-          break;
-        }
-        case 'generate_home_blueprint':
-          result = await client.generateHomeBlueprint();
-          break;
-        case 'audit_system_safety':
-          result = await client.auditSystemSafety();
-          break;
-        case 'calculate_energy_insights':
-          result = await client.calculateEnergyInsights();
-          break;
-        case 'get_semantic_path': {
-          const { itemName } = z.object({ itemName: z.string() }).parse(args);
-          result = await client.getSemanticPath(itemName);
-          break;
-        }
-        case 'find_neighboring_equipment': {
-          const { itemName } = z.object({ itemName: z.string() }).parse(args);
-          result = await client.findNeighboringEquipment(itemName);
-          break;
-        }
-        case 'schedule_command': {
-          const { itemName, command, delayMs } = z.object({ itemName: z.string(), command: z.string(), delayMs: z.number() }).parse(args);
-          result = await client.scheduleCommand(itemName, command, delayMs);
-          break;
-        }
-        case 'get_stale_items': {
-          const { days } = z.object({ days: z.number().optional() }).parse(args);
-          result = await client.getStaleItems(days);
+
+        case 'remediate': {
+          const parsed = z
+            .object({
+              action: z.enum([
+                'bulk_update',
+                'create_equipment',
+                'suggest_tags',
+                'standardize_naming',
+                'optimize_persistence',
+                'export_snapshot',
+                'boilerplate',
+              ]),
+              itemNames: z.array(z.string()).optional(),
+              updates: z
+                .object({
+                  tags: z.array(z.string()).optional(),
+                  category: z.string().optional(),
+                  groupNames: z.array(z.string()).optional(),
+                })
+                .optional(),
+              thingUID: z.string().optional(),
+              roomGroup: z.string().optional(),
+              itemName: z.string().optional(),
+            })
+            .parse(args);
+
+          switch (parsed.action) {
+            case 'bulk_update':
+              result = await client.bulkItemRemediation(parsed.itemNames!, parsed.updates!);
+              break;
+            case 'create_equipment':
+              result = await client.createEquipmentFromThing(parsed.thingUID!, parsed.roomGroup!);
+              break;
+            case 'suggest_tags':
+              result = await client.suggestSemanticTags(parsed.itemName!);
+              break;
+            case 'standardize_naming':
+              result = await client.standardizeNamingConvention();
+              break;
+            case 'optimize_persistence':
+              result = await client.optimizePersistenceStrategy();
+              break;
+            case 'export_snapshot':
+              result = await client.exportSystemSnapshot();
+              break;
+            case 'boilerplate':
+              result = await client.generateSystemBoilerplate();
+              break;
+          }
           break;
         }
-        case 'trigger_discovery_scan': {
-          const { bindingId } = z.object({ bindingId: z.string() }).parse(args);
-          result = await client.triggerDiscoveryScan(bindingId);
+
+        case 'control_media': {
+          const { equipmentName, action } = z
+            .object({
+              equipmentName: z.string(),
+              action: z.enum(['play', 'pause', 'next', 'previous', 'volume_up', 'volume_down']),
+            })
+            .parse(args);
+          result = await client.controlMedia(equipmentName, action);
           break;
         }
-        case 'chat_with_habot': {
-          const { text } = z.object({ text: z.string() }).parse(args);
-          result = await client.chatWithHabot(text);
+
+        case 'mcp_status': {
+          const { action } = z
+            .object({ action: z.enum(['health', 'capabilities', 'prompt_context']) })
+            .parse(args);
+          if (action === 'health') result = client.getMcpHealth();
+          else if (action === 'capabilities') result = client.getMcpCapabilities();
+          else result = await client.getPromptContext();
           break;
         }
 
@@ -924,7 +1314,7 @@ export function registerTools(server: Server, client: OpenHabClient) {
         content: [
           {
             type: 'text',
-            text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+            text: typeof result === 'string' ? result : JSON.stringify(result),
           },
         ],
       };

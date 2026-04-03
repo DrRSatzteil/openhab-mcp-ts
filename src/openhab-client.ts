@@ -6,6 +6,8 @@
 import axios, { AxiosInstance } from 'axios';
 import http from 'http';
 import https from 'https';
+import fs from 'fs';
+import path from 'path';
 import {
   OpenHabItem,
   OpenHabThing,
@@ -22,13 +24,16 @@ import {
   OpenHabTemplate,
   OpenHabTransformation,
 } from './types.js';
+import { readLastLines, normalizeEventLog } from './log-parser.js';
 
 export class OpenHabClient {
   private client: AxiosInstance;
   private cache = new Map<string, { data: unknown; expiry: number }>();
+  private pending = new Map<string, Promise<unknown>>();
+  private filteredCacheKeys = new Set<string>();
   private scenes = new Map<string, Array<{ itemName: string; command: string }>>();
   private readonly META_CACHE_TTL = 300000; // 5 minutes for metadata
-  private readonly ITEM_CACHE_TTL = 10000; // 10 seconds for items/state
+  private readonly ITEM_CACHE_TTL = 60000; // 60 seconds (relies on SSE patch for invalidation)
   private readonly debug: boolean;
   private abortController: AbortController | null = null;
   private reconnectTimeout = 1000;
@@ -36,8 +41,35 @@ export class OpenHabClient {
   private eventLogBuffer: string[] = [];
   private readonly MAX_LOG_BUFFER = 5000;
   private focusScope: { type: 'room' | 'group'; name: string } | null = null;
-  private searchIndex: Map<string, any> = new Map();
-  private lastIndexUpdate = 0;
+  private logFolderPath: string | null = null;
+
+  /**
+   * Semantic index — rebuilt whenever items_all is populated or patched.
+   * Enables O(1) token / room / tag lookups instead of full O(n) scans.
+   */
+  private semanticIndex: {
+    byRoom: Map<string, Set<string>>; // groupName.lower  -> Set<itemName> (direct membership)
+    byTag: Map<string, Set<string>>; // tag             -> Set<itemName>
+    byType: Map<string, Set<string>>; // itemType        -> Set<itemName>
+    byToken: Map<string, Set<string>>; // word token      -> Set<itemName>
+    byPrefix: Map<string, Set<string>>; // prefix(2+)      -> Set<itemName> (for prefix search)
+    byCategory: Map<string, Set<string>>; // category.lower  -> Set<itemName>
+    itemMap: Map<string, OpenHabItem>; // itemName        -> item
+    itemToRoom: Map<string, string>; // itemName -> room.name (transitive: Location→Equipment→Point)
+    itemToEquipment: Map<string, string>; // itemName -> equipment.name (direct parent Equipment)
+    rooms: OpenHabItem[]; // Location items
+  } = {
+    byRoom: new Map(),
+    byTag: new Map(),
+    byType: new Map(),
+    byToken: new Map(),
+    byPrefix: new Map(),
+    byCategory: new Map(),
+    itemMap: new Map(),
+    itemToRoom: new Map(),
+    itemToEquipment: new Map(),
+    rooms: [],
+  };
 
   constructor(
     baseUrl: string,
@@ -89,12 +121,57 @@ export class OpenHabClient {
       this.initEventStream();
     }
 
-    // Optimization: Background pre-warm of items/things cache to make first interaction instant
+    // Defer ALL I/O out of the constructor so the MCP transport can start
+    // accepting requests immediately.
+    // NOTE: Log/conf folder paths are NOT auto-detected — they may reside on a
+    // remote server or network share.  Use setLogFolderPath() (exposed via the
+    // set_log_folder tool) to configure the path before using filesystem-based
+    // log search features.
     setTimeout(() => {
       this.log('Pre-warming cache...');
-      this.getItems().catch(() => {});
-      this.getThings().catch(() => {});
-    }, 100);
+      console.error('[OpenHAB MCP] Warming up — fetching items...');
+      // Pre-warm only the slim item list (no metadata, no things).
+      // Things are fetched lazily on first use; SSE keeps item states live.
+      this.getItems()
+        .then(() => {
+          console.error('[OpenHAB MCP] Ready — cache warm, semantic index built.');
+        })
+        .catch(() => {});
+    }, 0); // 0 ms: yield to event loop, then start
+  }
+
+  /**
+   * Set the path to the OpenHAB log folder (local path or mounted network share).
+   * Must be called before using searchLogs() or preWarmLogBuffer().
+   * Example paths:
+   *   Local:   /var/log/openhab
+   *   SMB:     /mnt/openhab-logs
+   *   GVFS:    /home/user/.XDG_RUNTIME_DIR/gvfs/smb-share:server=openhab.local,share=openhab-logs
+   */
+  public setLogFolderPath(folderPath: string): void {
+    this.logFolderPath = folderPath;
+    this.log(`Log folder path set to: ${folderPath}`);
+    // Pre-warm the log buffer from the newly configured path
+    this.preWarmLogBuffer().catch(() => {});
+  }
+
+  // detectLogFoldersAsync() has been removed.
+  // Log folder paths are never auto-detected because logs and conf files may
+  // reside on a remote server or network share that is not available on this
+  // machine.  Use setLogFolderPath() instead.
+
+  private async preWarmLogBuffer(): Promise<void> {
+    if (!this.logFolderPath) return;
+
+    const eventsLog = path.join(this.logFolderPath, 'events.log');
+    if (fs.existsSync(eventsLog)) {
+      this.log('Pre-warming log buffer from events.log...');
+      const lines = await readLastLines(eventsLog, 500);
+      const normalized = lines.map(normalizeEventLog).filter((l): l is string => l !== null);
+
+      this.eventLogBuffer = [...normalized, ...this.eventLogBuffer].slice(-this.MAX_LOG_BUFFER);
+      this.log(`Pre-warmed buffer with ${normalized.length} historical events.`);
+    }
   }
 
   private log(message: string): void {
@@ -142,15 +219,16 @@ export class OpenHabClient {
         this.reconnectSSE();
       });
 
-      stream.on('error', (err: any) => {
+      stream.on('error', (err: Error) => {
         this.log(`Event Stream error: ${err.message}. Reconnecting...`);
         this.reconnectSSE();
       });
 
       this.reconnectTimeout = 1000; // Reset on success
-    } catch (error: any) {
-      if (error.name !== 'CanceledError' && error.name !== 'AbortError') {
-        this.log(`SSE connection failed: ${error.message}`);
+    } catch (error: unknown) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      if (err.name !== 'CanceledError' && err.name !== 'AbortError') {
+        this.log(`SSE connection failed: ${err.message}`);
         this.reconnectSSE();
       }
     }
@@ -163,10 +241,12 @@ export class OpenHabClient {
     }, this.reconnectTimeout);
   }
 
-  private handleSSEEvent(event: any): void {
+  private handleSSEEvent(event: { topic: string; payload: string; type?: string }): void {
     const topicParts = event.topic.split('/');
-    // Check for smarthome/items/*/statechanged
-    if (topicParts[0] === 'smarthome' && topicParts[1] === 'items') {
+    // Support both OH ≤4 (smarthome/*) and OH5+ (openhab/*) topic prefixes.
+    const isItemTopic =
+      (topicParts[0] === 'smarthome' || topicParts[0] === 'openhab') && topicParts[1] === 'items';
+    if (isItemTopic) {
       const itemName = topicParts[2];
       const eventType = topicParts[3];
 
@@ -180,18 +260,30 @@ export class OpenHabClient {
         const cacheKey = `item_${itemName}`;
         const cached = this.cache.get(cacheKey);
         if (cached) {
-          (cached.data as any).state = payload.value;
+          (cached.data as OpenHabItem).state = payload.value;
           cached.expiry = Date.now() + this.ITEM_CACHE_TTL;
         }
 
-        // Always invalidate the 'all items' list which might contain this item
-        this.cache.delete('items_all');
+        // Patch both the slim and metadata-inclusive bulk caches so subsequent
+        // reads reflect the new state without waiting for TTL expiry.
+        for (const bulkKey of ['items_all', 'items_all_meta']) {
+          const allCached = this.cache.get(bulkKey);
+          if (allCached) {
+            const itemInAll = (allCached.data as OpenHabItem[]).find((i) => i.name === itemName);
+            if (itemInAll) itemInAll.state = payload.value;
+          }
+        }
+        // Keep semantic index itemMap entry in sync
+        const indexed = this.semanticIndex.itemMap.get(itemName);
+        if (indexed) indexed.state = payload.value;
       } else if (eventType === 'added' || eventType === 'removed') {
         this.log(`SSE SYNC: Item ${itemName} ${eventType}. Clearing caches.`);
         this.addLogToBuffer(
           `${new Date().toISOString()} - Item${eventType === 'added' ? 'Added' : 'Removed'}Event - ${itemName}`
         );
         this.invalidateItemCache(itemName);
+        // Trigger an immediate background refetch so the index rebuilds promptly.
+        this.getItems().catch(() => {});
       }
     } else {
       // Log other interesting events
@@ -206,6 +298,12 @@ export class OpenHabClient {
           this.addLogToBuffer(
             `${new Date().toISOString()} - ${eventType} - ${topicParts.slice(2, -1).join('/')}`
           );
+        }
+        // Optimization: When a Thing status changes, invalidate the things_all cache so
+        // the next read reflects the new ONLINE/OFFLINE state without waiting for TTL expiry.
+        if (eventType === 'ThingStatusInfoChangedEvent') {
+          this.cache.delete('things_all');
+          this.log('SSE SYNC: Thing status changed. Invalidated things_all cache.');
         }
       }
     }
@@ -227,10 +325,28 @@ export class OpenHabClient {
       return cached.data as T;
     }
 
+    // Optimization: In-flight deduplication — if a fetch for this key is already
+    // in progress, return the same promise instead of firing a second HTTP request.
+    const inflight = this.pending.get(key);
+    if (inflight) {
+      this.log(`Cache DEDUP: ${key}`);
+      return inflight as Promise<T>;
+    }
+
     this.log(`Cache MISS: ${key}`);
-    const data = await fetcher();
-    this.cache.set(key, { data, expiry: now + ttl });
-    return data;
+    const promise = fetcher()
+      .then((data) => {
+        this.cache.set(key, { data, expiry: Date.now() + ttl });
+        this.pending.delete(key);
+        return data;
+      })
+      .catch((err) => {
+        this.pending.delete(key);
+        throw err;
+      });
+
+    this.pending.set(key, promise as Promise<unknown>);
+    return promise;
   }
 
   private invalidateItemCache(itemName?: string): void {
@@ -240,48 +356,364 @@ export class OpenHabClient {
     }
     this.log('Invalidating global items cache');
     this.cache.delete('items_all');
-    // Also clear keys that might have filters if we want to be safe,
-    // but for now we mainly cache the common 'all items' request.
+    this.cache.delete('items_all_meta');
+    // Also clear any filtered item cache keys (e.g. items_Switch_...) so
+    // stale results don't linger after an item is added, modified, or removed.
+    for (const key of this.filteredCacheKeys) {
+      this.cache.delete(key);
+    }
+    this.filteredCacheKeys.clear();
   }
 
+  // ---------------------------------------------------------------------------
+  // Semantic Index
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build (or rebuild) the semantic index from a freshly fetched item list.
+   * Iterates items once and populates all lookup maps.
+   */
+  private buildSemanticIndex(items: OpenHabItem[]): void {
+    const byRoom = new Map<string, Set<string>>();
+    const byTag = new Map<string, Set<string>>();
+    const byType = new Map<string, Set<string>>();
+    const byToken = new Map<string, Set<string>>();
+    const byPrefix = new Map<string, Set<string>>();
+    const byCategory = new Map<string, Set<string>>();
+    const itemMap = new Map<string, OpenHabItem>();
+    const rooms: OpenHabItem[] = [];
+
+    const addTo = (map: Map<string, Set<string>>, key: string, value: string) => {
+      let s = map.get(key);
+      if (!s) {
+        s = new Set();
+        map.set(key, s);
+      }
+      s.add(value);
+    };
+
+    // Tokenise a string into lowercase words, splitting on underscores and spaces
+    const tokenise = (s: string): string[] =>
+      s
+        .toLowerCase()
+        .replace(/[_-]/g, ' ')
+        .split(/\s+/)
+        .filter((t) => t.length > 1);
+
+    for (const item of items) {
+      itemMap.set(item.name, item);
+      addTo(byType, item.type, item.name);
+
+      for (const tag of item.tags ?? []) {
+        const norm = tag.toLowerCase();
+        addTo(byTag, norm, item.name);
+        for (const t of tokenise(tag)) addTo(byTag, t, item.name);
+      }
+
+      for (const grp of item.groupNames ?? []) {
+        addTo(byRoom, grp.toLowerCase(), item.name);
+      }
+
+      if (item.tags?.some((t) => t.toLowerCase().includes('location'))) {
+        rooms.push(item);
+        // Let the room be searchable by its own label words too
+        for (const t of tokenise(item.label ?? item.name)) addTo(byRoom, t, item.name);
+      }
+
+      for (const t of tokenise(item.name)) addTo(byToken, t, item.name);
+      if (item.label) {
+        for (const t of tokenise(item.label)) addTo(byToken, t, item.name);
+      }
+
+      // Index category (e.g. 'Motion', 'Temperature', 'Switch') for category-based searches
+      if (item.category) {
+        const cat = item.category.toLowerCase();
+        addTo(byCategory, cat, item.name);
+        for (const t of tokenise(item.category)) addTo(byCategory, t, item.name);
+      }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase 2: Build transitive itemToRoom and itemToEquipment via BFS.
+    //
+    // OpenHAB's semantic model is: Location (group) → Equipment (group) → Point (item).
+    // The first pass only links items to their DIRECT parent group. A Point inside
+    // Equipment inside a Room is NOT visible under the Room in byRoom.
+    // BFS from every Location downward ensures all descendants are mapped.
+    // ---------------------------------------------------------------------------
+    const itemToRoom = new Map<string, string>(); // itemName -> room.name (transitive)
+    const itemToEquipment = new Map<string, string>(); // itemName -> equipment group name
+    const groupSet = new Set(byType.get('Group') ?? []);
+
+    for (const room of rooms) {
+      const queue: string[] = [room.name];
+      const visited = new Set<string>();
+      while (queue.length > 0) {
+        const groupName = queue.shift()!;
+        if (visited.has(groupName)) continue;
+        visited.add(groupName);
+        const members = byRoom.get(groupName.toLowerCase());
+        if (!members) continue;
+        for (const memberName of members) {
+          if (!itemToRoom.has(memberName)) itemToRoom.set(memberName, room.name);
+          const memberItem = itemMap.get(memberName);
+          // Track direct Equipment parentage so Points can report their Equipment
+          if (memberItem?.tags?.some((t) => t.toLowerCase().includes('equipment'))) {
+            const equipChildren = byRoom.get(memberName.toLowerCase());
+            if (equipChildren) {
+              for (const pointName of equipChildren) {
+                if (!itemToEquipment.has(pointName)) itemToEquipment.set(pointName, memberName);
+              }
+            }
+          }
+          if (groupSet.has(memberName)) queue.push(memberName);
+        }
+      }
+    }
+
+    // Phase 3: Propagate room label tokens back into byToken for every item in that room.
+    // This makes queries like "living room light" match items whose own name/label
+    // contains no location words (e.g. a channel-linked point called 'Dimmer_CH1').
+    const roomLabelTokens = new Map<string, string[]>();
+    for (const room of rooms) {
+      roomLabelTokens.set(room.name, tokenise(room.label ?? room.name));
+    }
+    for (const [itemName, roomName] of itemToRoom) {
+      const tokens = roomLabelTokens.get(roomName);
+      if (tokens) for (const t of tokens) addTo(byToken, t, itemName);
+    }
+
+    // Phase 4: Build prefix index — for each token of length ≥ 3, register every
+    // 2-char-and-up prefix so prefix searches are O(1) map lookups instead of O(n)
+    // full token-map scans. This is the dominant CPU cost during resolveItem() for
+    // short query terms like "kit" or "li".
+    for (const [token, itemNames] of byToken) {
+      for (let len = 2; len < token.length; len++) {
+        const prefix = token.slice(0, len);
+        // Only store if the prefix doesn't already have its own exact entry
+        if (!byToken.has(prefix)) {
+          let s = byPrefix.get(prefix);
+          if (!s) { s = new Set(); byPrefix.set(prefix, s); }
+          for (const n of itemNames) s.add(n);
+        }
+      }
+    }
+
+    this.semanticIndex = {
+      byRoom,
+      byTag,
+      byType,
+      byToken,
+      byPrefix,
+      byCategory,
+      itemMap,
+      itemToRoom,
+      itemToEquipment,
+      rooms,
+    };
+    this.log(
+      `Semantic index built: ${items.length} items, ${rooms.length} rooms, ` +
+        `${itemToRoom.size} room-mapped, ${byToken.size} tokens, ${byCategory.size} categories`
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // --- Items ---
-  async getItems(tags?: string, type?: string, metadata?: string): Promise<OpenHabItem[]> {
+  async getItems(
+    tags?: string,
+    type?: string,
+    metadata?: string,
+    state?: string
+  ): Promise<OpenHabItem[]> {
     const params: Record<string, string> = {};
     if (tags) params.tags = tags;
     if (type) params.type = type;
+    // Only fetch metadata when explicitly requested. The bulk metadata payload
+    // (voice-assistant mappings, widget config, synonyms, link profiles, etc.) is
+    // commonly 10–50× the size of the core item fields and is rarely needed by most
+    // operations. Callers that genuinely need metadata pass metadata='.*' explicitly.
     if (metadata) params.metadata = metadata;
 
-    const cacheKey = tags || type || metadata ? `items_${tags}_${type}_${metadata}` : 'items_all';
+    // Canonical cache key:
+    //   items_all        — slim (no metadata), powers the semantic index and most tools
+    //   items_all_meta   — metadata-inclusive, used only by auditVoiceExposure etc.
+    //   items_<filters>  — filtered subsets (tags/type/state queries)
+    const hasFilters = !!(tags || type || state);
+    const cacheKey = hasFilters
+      ? `items_${tags ?? ''}_${type ?? ''}_${metadata ?? ''}_${state ?? ''}`
+      : metadata
+        ? 'items_all_meta'
+        : 'items_all';
+
+    // Track non-default keys so targeted invalidation can clear them on item changes.
+    if (cacheKey !== 'items_all') {
+      this.filteredCacheKeys.add(cacheKey);
+    }
 
     return this.withCache(cacheKey, this.ITEM_CACHE_TTL, async () => {
+      // Restrict fields projection to exclude heavy read-only fields (lastState,
+      // lastStateUpdate, lastStateChange, stateDescription, link, editable, members).
+      // Image items (e.g. Frigate camera snapshots) have 100 KB+ base64 in lastState.
+      params.fields = metadata
+        ? 'name,state,label,type,category,tags,groupNames,metadata'
+        : 'name,state,label,type,category,tags,groupNames';
       const response = await this.client.get('/rest/items', { params });
       let items = response.data;
 
+      // Filter by strict state if requested
+      if (state) {
+        items = items.filter((i: OpenHabItem) => i.state.toString() === state);
+      }
+
       // Apply Focus Scope if active and no broader filter is requested
       if (this.focusScope && !tags && !type && !metadata) {
-        items = items.filter((i: any) => {
+        items = items.filter((i: OpenHabItem) => {
           if (this.focusScope!.type === 'room') return i.tags?.includes(this.focusScope!.name);
           if (this.focusScope!.type === 'group')
             return i.groupNames?.includes(this.focusScope!.name);
           return true;
         });
       }
+      // Rebuild semantic index only from the slim 'items_all' fetch — the index only
+      // uses name/label/type/tags/groupNames, none of which require metadata.
+      if (cacheKey === 'items_all') {
+        this.buildSemanticIndex(items);
+      }
+
       return items;
     });
   }
 
   async getItem(itemName: string): Promise<OpenHabItem> {
+    // Fast-path 1: semantic index itemMap is O(1) and is kept live by SSE patches.
+    // Use it whenever items_all is cached and fresh — avoids an O(n) array scan.
+    const allCached = this.cache.get('items_all');
+    if (allCached && allCached.expiry > Date.now()) {
+      const found = this.semanticIndex.itemMap.get(itemName);
+      if (found) {
+        this.log(`Cache HIT (itemMap fast-path): item_${itemName}`);
+        return found;
+      }
+    }
     return this.withCache(`item_${itemName}`, this.ITEM_CACHE_TTL, async () => {
-      const response = await this.client.get(`/rest/items/${itemName}`);
+      const response = await this.client.get(`/rest/items/${itemName}`, {
+        params: { metadata: '.*' },
+      });
       return response.data;
     });
   }
 
+  /**
+   * Optimization: Fetch multiple items in a single request to reduce round-trip delays.
+   * Checks individual item cache entries first; only fetches uncached items from the API.
+   * Writes fetched results back into the per-item cache so subsequent getItem() calls hit.
+   */
+  async getMultiItems(itemNames: string[]): Promise<OpenHabItem[]> {
+    const now = Date.now();
+    const results: OpenHabItem[] = [];
+    const missing: string[] = [];
+
+    for (const name of itemNames) {
+      const cached = this.cache.get(`item_${name}`);
+      if (cached && cached.expiry > now) {
+        this.log(`Cache HIT (multi): item_${name}`);
+        results.push(cached.data as OpenHabItem);
+      } else {
+        missing.push(name);
+      }
+    }
+
+    if (missing.length > 0) {
+      this.log(`Cache MISS (multi): fetching ${missing.length} items`);
+      const response = await this.client.get('/rest/items', {
+        params: {
+          names: missing.join(','),
+          fields: 'name,state,label,type,category,tags,groupNames,metadata',
+          metadata: '.*',
+        },
+      });
+      const fetched: OpenHabItem[] = response.data;
+
+      // Write-through: populate per-item cache and also patch items_all if present
+      const allCached = this.cache.get('items_all');
+      for (const item of fetched) {
+        this.cache.set(`item_${item.name}`, { data: item, expiry: now + this.ITEM_CACHE_TTL });
+        if (allCached) {
+          const idx = (allCached.data as OpenHabItem[]).findIndex((i) => i.name === item.name);
+          if (idx !== -1) (allCached.data as OpenHabItem[])[idx] = item;
+        }
+        results.push(item);
+      }
+    }
+
+    // Restore original requested order
+    const nameIndex = new Map(results.map((i, idx) => [i.name, idx]));
+    return itemNames.map((n) => results[nameIndex.get(n) ?? 0]).filter(Boolean);
+  }
+
   async sendCommand(itemName: string, command: string): Promise<string> {
+    // Optimization: Smart Command Casting (also used to prime item type for optimistic patch)
+    let processedCommand = command;
+    try {
+      const item = await this.getItem(itemName);
+      if (item.type === 'Dimmer') {
+        if (command.toUpperCase() === 'ON') processedCommand = '100';
+        if (command.toUpperCase() === 'OFF') processedCommand = '0';
+      } else if (item.type === 'Switch') {
+        if (command === '100') processedCommand = 'ON';
+        if (command === '0') processedCommand = 'OFF';
+      } else if (item.type === 'Color' && command.startsWith('#')) {
+        const hex = command.replace('#', '');
+        if (hex.length === 6) {
+          const r = parseInt(hex.substring(0, 2), 16) / 255;
+          const g = parseInt(hex.substring(2, 4), 16) / 255;
+          const b = parseInt(hex.substring(4, 6), 16) / 255;
+          const max = Math.max(r, g, b),
+            min = Math.min(r, g, b);
+          let h = 0,
+            s = 0;
+          const v = max;
+          const d = max - min;
+          s = max === 0 ? 0 : d / max;
+          if (max !== min) {
+            switch (max) {
+              case r:
+                h = (g - b) / d + (g < b ? 6 : 0);
+                break;
+              case g:
+                h = (b - r) / d + 2;
+                break;
+              case b:
+                h = (r - g) / d + 4;
+                break;
+            }
+            h /= 6;
+          }
+          processedCommand = `${Math.round(h * 360)},${Math.round(s * 100)},${Math.round(v * 100)}`;
+        }
+      }
+    } catch {
+      // Ignore fetch errors, proceed with raw command
+    }
+
     this.invalidateItemCache(itemName);
-    const response = await this.client.post(`/rest/items/${itemName}`, command, {
+    const response = await this.client.post(`/rest/items/${itemName}`, processedCommand, {
       headers: { 'Content-Type': 'text/plain', Accept: '*/*' },
     });
+
+    // Optimization: Optimistic cache patch — update the known state immediately so
+    // subsequent reads within the same session see the new value without a round-trip.
+    const optimisticState = processedCommand;
+    const cachedItem = this.cache.get(`item_${itemName}`);
+    if (cachedItem) {
+      (cachedItem.data as OpenHabItem).state = optimisticState;
+    }
+    const allCached = this.cache.get('items_all');
+    if (allCached) {
+      const itemInAll = (allCached.data as OpenHabItem[]).find((i) => i.name === itemName);
+      if (itemInAll) itemInAll.state = optimisticState;
+    }
+
     return response.data;
   }
 
@@ -293,9 +725,22 @@ export class OpenHabClient {
     return response.data;
   }
 
-  async createOrUpdateItem(itemName: string, itemData: Partial<OpenHabItem>): Promise<void> {
+  async createOrUpdateItem(itemName: string, itemData: Record<string, unknown>): Promise<void> {
     this.invalidateItemCache(itemName);
-    const response = await this.client.put(`/rest/items/${itemName}`, itemData);
+    const { metadata, ...coreData } = itemData;
+
+    // 1. Create/Update core item (handles tags and groupNames natively)
+    const response = await this.client.put(`/rest/items/${itemName}`, coreData);
+
+    // 2. Configure metadata if provided in the consolidated payload
+    if (metadata && typeof metadata === 'object') {
+      for (const [namespace, data] of Object.entries(metadata)) {
+        const valData = data as Record<string, unknown>;
+        const payload =
+          typeof valData === 'object' && valData !== null ? valData : { value: valData };
+        await this.client.put(`/rest/items/${itemName}/metadata/${namespace}`, payload);
+      }
+    }
     return response.data;
   }
 
@@ -343,46 +788,55 @@ export class OpenHabClient {
     roomName: string,
     equipmentType: string
   ): Promise<Array<{ equipment: OpenHabItem; points: OpenHabItem[] }>> {
-    // 1. Get all items to build the relationship map
-    const allItems = await this.getItems();
+    await this.getItems(); // ensure index
+    const idx = this.semanticIndex;
+    const roomLower = roomName.toLowerCase();
+    const eqTypeLower = equipmentType.toLowerCase();
 
-    // 2. Find the room item (usually a location-tagged group)
-    const room = allItems.find(
-      (i) =>
-        (i.name === roomName || i.label === roomName) &&
-        i.tags?.some((t) => t.toLowerCase().includes('location'))
-    );
+    // 1. Resolve room via index — O(1) map or short rooms-list scan
+    const room =
+      (idx.itemMap.get(roomName)?.tags?.some((t) => t.toLowerCase().includes('location'))
+        ? idx.itemMap.get(roomName)
+        : undefined) ??
+      idx.rooms.find(
+        (r) => r.name.toLowerCase() === roomLower || r.label?.toLowerCase() === roomLower
+      );
 
     if (!room) {
       this.log(`Semantic Search: Room '${roomName}' not found.`);
       return [];
     }
 
-    // 3. Find equipment in that room
-    // Equipment are items that have the room as a parent group AND have an equipment tag
-    const equipment = allItems.filter(
-      (i) =>
-        i.groupNames?.includes(room.name) &&
-        i.tags?.some((t) => t.toLowerCase().includes(equipmentType.toLowerCase()))
-    );
+    // 2. Direct children from byRoom (O(1) map lookup)
+    const childNames = idx.byRoom.get(room.name.toLowerCase()) ?? new Set<string>();
+    const equipment = Array.from(childNames)
+      .map((n) => idx.itemMap.get(n)!)
+      .filter((i) => i && i.tags?.some((t) => t.toLowerCase().includes(eqTypeLower)));
 
-    // 4. For each equipment, find its points (child items)
-    return equipment.map((e) => {
-      const points = allItems.filter((i) => i.groupNames?.includes(e.name));
-      return { equipment: e, points };
-    });
+    // 3. Points via byRoom for each equipment group — O(1) per equipment
+    return equipment.map((e) => ({
+      equipment: e,
+      points: Array.from(idx.byRoom.get(e.name.toLowerCase()) ?? [])
+        .map((n) => idx.itemMap.get(n)!)
+        .filter(Boolean),
+    }));
   }
 
   // --- Things ---
   async getThings(): Promise<OpenHabThing[]> {
-    return this.withCache('things_all', this.ITEM_CACHE_TTL, async () => {
+    return this.withCache('things_all', this.META_CACHE_TTL, async () => {
       const response = await this.client.get('/rest/things');
-      return response.data;
+      // Strip channels from bulk list — each thing can have 50–100 channel definitions
+      // which bloat payloads dramatically without being needed for status/command flows.
+      // Individual getThing() still returns full data with channels.
+      return (response.data as OpenHabThing[]).map(
+        ({ channels: _ch, ...rest }) => rest as OpenHabThing
+      );
     });
   }
 
   async getThing(thingUID: string): Promise<OpenHabThing> {
-    return this.withCache(`thing_${thingUID}`, this.ITEM_CACHE_TTL, async () => {
+    return this.withCache(`thing_${thingUID}`, this.META_CACHE_TTL, async () => {
       const response = await this.client.get(`/rest/things/${thingUID}`);
       return response.data;
     });
@@ -590,11 +1044,11 @@ export class OpenHabClient {
     endtime?: string,
     serviceId?: string
   ): Promise<Record<string, unknown>> {
-    // 1. Get item metadata to determine type
-    const item = await this.getItem(itemName);
-
-    // 2. Get the historical data
-    const data = await this.getItemPersistenceData(itemName, serviceId, starttime, endtime);
+    // item metadata and historical data are independent — fetch in parallel
+    const [item, data] = await Promise.all([
+      this.getItem(itemName),
+      this.getItemPersistenceData(itemName, serviceId, starttime, endtime),
+    ]);
 
     if (!data.data || data.data.length === 0) {
       return { itemName, message: 'No data available for this period' };
@@ -653,15 +1107,27 @@ export class OpenHabClient {
    * Handles Player items, Dimmers (volume), and Switches (power/play).
    */
   async controlMedia(equipmentName: string, action: string): Promise<string> {
-    const allItems = await this.getItems();
-    const equipment = allItems.find((i) => i.name === equipmentName || i.label === equipmentName);
+    await this.getItems(); // ensure index
+    const idx = this.semanticIndex;
 
+    // Resolve equipment: try exact name first (O(1)), then label scan over itemMap
+    let equipment = idx.itemMap.get(equipmentName);
     if (!equipment) {
-      throw new Error(`Equipment '${equipmentName}' not found`);
+      const labelLower = equipmentName.toLowerCase();
+      for (const [, item] of idx.itemMap) {
+        if (item.label?.toLowerCase() === labelLower) {
+          equipment = item;
+          break;
+        }
+      }
     }
+    if (!equipment) throw new Error(`Equipment '${equipmentName}' not found`);
 
-    // Find all points associated with this equipment
-    const points = allItems.filter((i) => i.groupNames?.includes(equipment.name));
+    // Points: O(1) byRoom lookup on equipment group name instead of O(n) filter
+    const pointNames = idx.byRoom.get(equipment.name.toLowerCase()) ?? new Set<string>();
+    const points = Array.from(pointNames)
+      .map((n) => idx.itemMap.get(n)!)
+      .filter(Boolean);
 
     const player = points.find((p) => p.type === 'Player');
     const volume = points.find(
@@ -868,8 +1334,8 @@ export class OpenHabClient {
       recommendation: string;
     };
   }> {
-    const items = await this.getItems();
-    const things = await this.getThings();
+    // Optimization: fetch items and things concurrently — they are independent
+    const [items, things] = await Promise.all([this.getItems(), this.getThings()]);
 
     // 1. Group items by type
     const itemStats: Record<string, number> = {};
@@ -877,15 +1343,26 @@ export class OpenHabClient {
       itemStats[i.type] = (itemStats[i.type] || 0) + 1;
     });
 
-    // 2. Find rooms (Locations)
-    const rooms = items
-      .filter((i) => i.tags?.some((t) => t.toLowerCase().includes('location')))
-      .map((i) => i.label || i.name);
+    // 2. Find rooms — use pre-built semantic index instead of O(n) filter
+    const rooms = this.semanticIndex.rooms.map((r) => r.label ?? r.name);
 
     // 3. Current "Active" states (e.g. Lights ON, Doors OPEN)
+    // Optimization: Prioritize "Smart" items like Switches and important Sensors
     const activeStates = items
-      .filter((i) => i.state === 'ON' || (i.type.includes('Number') && parseFloat(i.state) > 0))
-      .slice(0, 20) // Limit to top 20 for token safety
+      .filter((i) => {
+        const isSwitchOn = i.state === 'ON' || i.state === 'OPEN';
+        const isNotableNumber =
+          i.type.includes('Number') &&
+          parseFloat(i.state) > 0 &&
+          (i.name.toLowerCase().includes('temp') ||
+            i.name.toLowerCase().includes('lux') ||
+            i.name.toLowerCase().includes('battery'));
+        const isGlobalState =
+          i.name === 'Day' || i.name === 'House_Awake' || i.name.includes('_Awake');
+
+        return isSwitchOn || isNotableNumber || isGlobalState;
+      })
+      .slice(0, 30) // Increased limit for better context
       .map((i) => `${i.label || i.name}: ${i.state}`);
 
     // 4. Offline/Error check
@@ -926,8 +1403,8 @@ export class OpenHabClient {
     if (type === 'application/javascript') {
       try {
         new Function(script);
-      } catch (e: any) {
-        errors.push(`JS Syntax Error: ${e.message}`);
+      } catch (e: unknown) {
+        errors.push(`JS Syntax Error: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
@@ -1001,67 +1478,201 @@ export class OpenHabClient {
   /**
    * Executes multiple commands in parallel.
    */
-  async executeBatch(commands: Array<{ itemName: string; command: string }>): Promise<string[]> {
+  async executeBatch(
+    commands: Array<{ itemName: string; command?: string; state?: string }>
+  ): Promise<string[]> {
     this.log(`Executing batch of ${commands.length} commands...`);
-    const results: any[] = await Promise.all(
-      commands.map((c) =>
-        this.sendCommand(c.itemName, c.command)
-          .then(() => `Success on ${c.itemName}: ${c.command}`)
-          .catch((e) => `Error on ${c.itemName}: ${e.message}`)
-      )
+    const results: string[] = await Promise.all(
+      commands.map((c) => {
+        if (c.command !== undefined) {
+          return this.sendCommand(c.itemName, c.command)
+            .then(() => `Command Success on ${c.itemName}: ${c.command}`)
+            .catch((e) => `Error on ${c.itemName}: ${e.message}`);
+        } else if (c.state !== undefined) {
+          return this.updateState(c.itemName, c.state)
+            .then(() => `State Update Success on ${c.itemName}: ${c.state}`)
+            .catch((e) => `Error on ${c.itemName}: ${e.message}`);
+        } else {
+          return Promise.resolve(`Error on ${c.itemName}: No command or state provided.`);
+        }
+      })
     );
     return results;
   }
 
   /**
    * Fuzzy search for items by name, label, tags, or groups.
+   * Uses the semantic index for O(1) token lookups and set intersections.
    */
   async searchItems(query: string): Promise<OpenHabItem[]> {
-    const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    const terms = query
+      .toLowerCase()
+      .replace(/[_-]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 1);
     if (terms.length === 0) return [];
-    
-    const allItems = await this.getItems();
 
-    return allItems
-      .filter((i) => {
-        const haystack = `${i.name} ${i.label || ''} ${i.tags?.join(' ') || ''} ${i.groupNames?.join(' ') || ''}`.toLowerCase();
-        return terms.every(term => haystack.includes(term));
+    await this.getItems(); // ensure index is built
+    const idx = this.semanticIndex;
+
+    // For each term collect candidate sets from all dimensions, then intersect
+    let candidates: Set<string> | null = null;
+    for (const term of terms) {
+      const hits = new Set<string>();
+      const sources = [
+        idx.byToken.get(term),
+        idx.byRoom.get(term),
+        idx.byTag.get(term),
+        idx.byType.get(term),
+        idx.byCategory.get(term),
+        // O(1) prefix lookup via pre-built byPrefix index
+        idx.byPrefix.get(term),
+      ];
+      for (const s of sources) if (s) for (const n of s) hits.add(n);
+
+      if (candidates === null) {
+        candidates = hits;
+      } else {
+        for (const n of candidates) if (!hits.has(n)) candidates.delete(n);
+      }
+    }
+
+    return Array.from(candidates ?? [])
+      .slice(0, 50)
+      .map((n) => idx.itemMap.get(n)!)
+      .filter(Boolean);
+  }
+
+  /**
+   * Semantic item resolver: converts natural-language intent into ranked matches.
+   *
+   * This is the PRIMARY discovery tool the LLM should call instead of blind
+   * search loops. It scores candidates across every index dimension and returns
+   * the top results with enough context (exact name, label, room, type, state)
+   * to act immediately without any follow-up calls.
+   *
+   * Examples:
+   *   "kitchen light"          -> Kitchen_Ceiling_Switch (Switch, OFF, Kitchen)
+   *   "front door"             -> Door_FrontDoor_OpenClosed (Contact, CLOSED, Hallway)
+   *   "living room thermostat" -> LivingRoom_Thermostat_SetPoint (Number, 21.0, LivingRoom)
+   */
+  async resolveItem(query: string): Promise<
+    Array<{
+      name: string;
+      label?: string;
+      type: string;
+      state: string;
+      room?: string;
+      equipment?: string;
+      tags: string[];
+      score: number;
+    }>
+  > {
+    await this.getItems(); // ensure index exists
+    const idx = this.semanticIndex;
+    const terms = query
+      .toLowerCase()
+      .replace(/[_-]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 1);
+    if (terms.length === 0) return [];
+
+    const scores = new Map<string, number>();
+    const bump = (set: Set<string> | undefined, weight: number) => {
+      if (!set) return;
+      for (const n of set) scores.set(n, (scores.get(n) ?? 0) + weight);
+    };
+
+    for (const term of terms) {
+      bump(idx.byToken.get(term), 3); // label/name/room-propagated token exact match
+      bump(idx.byRoom.get(term), 3); // direct group membership keyword
+      bump(idx.byTag.get(term), 2); // semantic tag
+      bump(idx.byCategory.get(term), 2); // category (Motion, Temperature, etc.)
+      bump(idx.byType.get(term), 1); // item type
+      bump(idx.byType.get(term.charAt(0).toUpperCase() + term.slice(1)), 1);
+      // O(1) prefix bonus via pre-built byPrefix index (replaces O(n) token map scan)
+      bump(idx.byPrefix.get(term), 1);
+    }
+
+    if (scores.size === 0) return [];
+
+    // Use pre-built transitive itemToRoom (covers Location→Equipment→Point chains).
+    // No inline room computation needed — O(1) per item.
+    const roomLabelOf = new Map(idx.rooms.map((r) => [r.name, r.label ?? r.name]));
+
+    return Array.from(scores.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([name, score]) => {
+        const item = idx.itemMap.get(name)!;
+        const roomName = idx.itemToRoom.get(name);
+        const equipName = idx.itemToEquipment.get(name);
+        return {
+          name: item.name,
+          label: item.label,
+          type: item.type,
+          state: item.state,
+          room: roomName ? (roomLabelOf.get(roomName) ?? roomName) : undefined,
+          equipment: equipName ? (idx.itemMap.get(equipName)?.label ?? equipName) : undefined,
+          tags: item.tags ?? [],
+          score,
+        };
       })
-      .slice(0, 50);
+      .filter((r) => r.name);
   }
 
   /**
    * Unified search across items, things, and rules.
    * Reduces multiple MCP calls when entity type is unknown.
+   * Returns slim projections to avoid metadata bloat — use query_items/query_things
+   * for full detail once the entity name is known.
    */
   async masterSearch(query: string): Promise<{
-    items: OpenHabItem[];
-    things: OpenHabThing[];
-    rules: OpenHabRule[];
+    items: Array<{ name: string; label?: string; type: string; state: string; room?: string }>;
+    things: Array<{ uid: string; label: string; status: string }>;
+    rules: Array<{ uid: string; name: string; enabled: boolean }>;
   }> {
-    const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    const terms = query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((t) => t.length > 0);
     if (terms.length === 0) return { items: [], things: [], rules: [] };
-    
-    // Fetch all in parallel for speed
+
+    // Use searchItems (semantic index) for items + parallel fetch for things/rules
     const [items, things, rules] = await Promise.all([
-      this.getItems(),
+      this.searchItems(query),
       this.getThings(),
-      this.getRules()
+      this.getRules(),
     ]);
 
+    const idx = this.semanticIndex;
+    const roomLabelOf = new Map(idx.rooms.map((r) => [r.name, r.label ?? r.name]));
+
     return {
-      items: items.filter(i => {
-        const haystack = `${i.name} ${i.label || ''} ${i.tags?.join(' ') || ''}`.toLowerCase();
-        return terms.every(term => haystack.includes(term));
-      }).slice(0, 20),
-      things: things.filter(t => {
-        const haystack = `${t.UID} ${t.label || ''}`.toLowerCase();
-        return terms.every(term => haystack.includes(term));
-      }).slice(0, 10),
-      rules: rules.filter(r => {
-        const haystack = `${r.uid} ${r.name || ''}`.toLowerCase();
-        return terms.every(term => haystack.includes(term));
-      }).slice(0, 10)
+      items: items.slice(0, 20).map((i) => {
+        const roomName = idx.itemToRoom.get(i.name);
+        return {
+          name: i.name,
+          label: i.label,
+          type: i.type,
+          state: i.state,
+          room: roomName ? (roomLabelOf.get(roomName) ?? roomName) : undefined,
+        };
+      }),
+      things: things
+        .filter((t) => {
+          const haystack = `${t.UID} ${t.label || ''}`.toLowerCase();
+          return terms.every((term) => haystack.includes(term));
+        })
+        .slice(0, 10)
+        .map((t) => ({ uid: t.UID, label: t.label, status: t.statusInfo?.status ?? 'UNKNOWN' })),
+      rules: rules
+        .filter((r) => {
+          const haystack = `${r.uid} ${r.name || ''}`.toLowerCase();
+          return terms.every((term) => haystack.includes(term));
+        })
+        .slice(0, 10)
+        .map((r) => ({ uid: r.uid, name: r.name, enabled: r.enabled })),
     };
   }
 
@@ -1074,44 +1685,50 @@ export class OpenHabClient {
     equipment: Array<{ info: OpenHabItem; points: OpenHabItem[] }>;
     standaloneItems: OpenHabItem[];
   }> {
-    const allItems = await this.getItems();
-    
-    // 1. Find the room
-    const room = allItems.find(i => 
-      (i.name.toLowerCase() === roomName.toLowerCase() || i.label?.toLowerCase() === roomName.toLowerCase()) &&
-      i.tags?.some(t => t.toLowerCase().includes('location'))
-    );
+    await this.getItems(); // ensure index
+    const idx = this.semanticIndex;
 
-    if (!room) {
-      throw new Error(`Room '${roomName}' not found in semantic model.`);
-    }
+    // 1. Resolve room via index — O(1) by name, or linear scan of rooms list by label
+    const roomLower = roomName.toLowerCase();
+    const room =
+      (idx.itemMap.get(roomName)?.tags?.some((t) => t.toLowerCase().includes('location'))
+        ? idx.itemMap.get(roomName)
+        : undefined) ??
+      idx.rooms.find(
+        (r) => r.name.toLowerCase() === roomLower || r.label?.toLowerCase() === roomLower
+      );
 
-    // 2. Find all direct children
-    const directChildren = allItems.filter(i => i.groupNames?.includes(room.name));
+    if (!room) throw new Error(`Room '${roomName}' not found in semantic model.`);
 
-    // 3. Separate Equipment from Points/Standalone
+    // 2. Direct children from byRoom (O(1) map lookup instead of O(n) filter)
+    const directChildNames = idx.byRoom.get(room.name.toLowerCase()) ?? new Set<string>();
+    const directChildren = Array.from(directChildNames)
+      .map((n) => idx.itemMap.get(n)!)
+      .filter(Boolean);
+
+    // 3. Separate Equipment from standalone Points — use byRoom for child points too
     const equipment = directChildren
-      .filter(i => i.tags?.some(t => t.toLowerCase().includes('equipment')))
-      .map(e => ({
+      .filter((i) => i.tags?.some((t) => t.toLowerCase().includes('equipment')))
+      .map((e) => ({
         info: e,
-        points: allItems.filter(p => p.groupNames?.includes(e.name))
+        points: Array.from(idx.byRoom.get(e.name.toLowerCase()) ?? [])
+          .map((n) => idx.itemMap.get(n)!)
+          .filter(Boolean),
       }));
 
-    const standaloneItems = directChildren.filter(i => 
-      !i.tags?.some(t => t.toLowerCase().includes('equipment'))
+    const standaloneItems = directChildren.filter(
+      (i) => !i.tags?.some((t) => t.toLowerCase().includes('equipment'))
     );
 
-    return {
-      room,
-      equipment,
-      standaloneItems
-    };
+    return { room, equipment, standaloneItems };
   }
 
   /**
    * Minimal schema mapping for discovery.
    */
-  async getSchema(): Promise<Array<{ name: string; type: string; label?: string; tags: string[]; groups: string[] }>> {
+  async getSchema(): Promise<
+    Array<{ name: string; type: string; label?: string; tags: string[]; groups: string[] }>
+  > {
     const items = await this.getItems();
     return items.map((i) => ({
       name: i.name,
@@ -1141,30 +1758,62 @@ export class OpenHabClient {
     context += `3. **Safety First**: Use the \`validate_rule_logic\` tool before committing new rule automation.\n\n`;
 
     context += `### Usage Tips\n`;
+    context += `**CRITICAL: NEVER iterate single tool calls. Use the minimum number of requests.**\n`;
+    context += `- **ALWAYS call \`resolve_item\` first** when looking for a specific item. It returns exact names, room, type, and current state in one call — no guessing, no loops.\n`;
     context += `- Use \`execute_batch\` when the user asks for multiple actions (e.g. 'Goodnight').\n`;
-    context += `- Use \`master_search\` for a combined search across items, things, and rules in one step.\n`;
-    context += `- Use \`get_room_inventory\` to see everything in a room (e.g. 'Kitchen') with equipment groupings.\n`;
-    context += `- Use \`get_semantic_path\` and \`find_neighboring_equipment\` to understand the spatial layout of the home.\n`;
+    context += `- Use \`master_search\` for a combined search across items, things, and rules.\n`;
+    context += `- Use \`get_room_inventory\` to see all equipment in a room with its point hierarchy.\n`;
+    context += `- Use \`get_semantic_path\` and \`find_neighboring_equipment\` for spatial reasoning.\n`;
     context += `- Use \`schedule_command\` for delayed actions (e.g. 'turn off in 20 minutes').\n`;
-    context += `- Use \`trigger_discovery_scan\` if you suspect hardware is missing or unlinked.\n`;
-    context += `- Use \`get_stale_items\` for proactive maintenance of sensors.\n`;
-    context += `- Refer to the \`openhab://schema\` resource for a full lightweight list of available controls.\n`;
+    context += `- Use \`get_stale_items\` for proactive sensor maintenance.\n\n`;
+
+    // Compact home quick-reference grouped by room.
+    // Format: "Room: name(type=state), name(type=state)"
+    // Much more token-efficient than a full markdown table while still giving
+    // the LLM exact item names and live states without additional queries.
+    const idx = this.semanticIndex;
+    const MAX_ITEMS_IN_CONTEXT = 100;
+    if (idx.rooms.length > 0) {
+      // Group non-Group items by their transitive room label
+      const roomLabelOf = new Map(idx.rooms.map((r) => [r.name, r.label ?? r.name]));
+      const byRoom = new Map<string, string[]>();
+      for (const [itemName, roomName] of idx.itemToRoom) {
+        const item = idx.itemMap.get(itemName);
+        if (!item || item.type === 'Group') continue;
+        const roomLabel = roomLabelOf.get(roomName) ?? roomName;
+        let bucket = byRoom.get(roomLabel);
+        if (!bucket) { bucket = []; byRoom.set(roomLabel, bucket); }
+        bucket.push(`${item.name}(${item.type}=${item.state})`);
+      }
+
+      const totalItems = Array.from(byRoom.values()).reduce((s, b) => s + b.length, 0);
+      context += `### Home Quick-Reference (${totalItems} items; call resolve_item for natural-language search)\n`;
+      let written = 0;
+      for (const [roomLabel, entries] of [...byRoom.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        if (written >= MAX_ITEMS_IN_CONTEXT) {
+          context += `…(${totalItems - written} more items — use resolve_item)\n`;
+          break;
+        }
+        const slice = entries.slice(0, MAX_ITEMS_IN_CONTEXT - written);
+        context += `${roomLabel}: ${slice.join(', ')}\n`;
+        written += slice.length;
+      }
+      context += '\n';
+    }
+
     return context;
   }
 
   /**
    * Consolidated first-interaction bootstrap.
-   * Returns prompt context, room list, and full structural schema in one call.
+   * Returns the guidance context string which already contains the compact
+   * room-grouped quick-reference (name, type, state per item).  The homeIndex
+   * was removed because it duplicated this data in a more verbose JSON form,
+   * significantly inflating the initial response token cost.
    */
-  async initialDiscovery(): Promise<{
-    context: string;
-    schema: Array<{ name: string; type: string; label?: string; tags: string[]; groups: string[] }>;
-  }> {
-    const [context, schema] = await Promise.all([
-      this.getPromptContext(),
-      this.getSchema()
-    ]);
-    return { context, schema };
+  async initialDiscovery(): Promise<{ context: string }> {
+    const context = await this.getPromptContext();
+    return { context };
   }
 
   /**
@@ -1223,8 +1872,8 @@ export class OpenHabClient {
    * Scans Things for hardware issues and connectivity drift.
    */
   async analyzeSystemHealth(): Promise<Record<string, string[]>> {
-    const things = await this.getThings();
-    const items = await this.getItems();
+    // Optimization: fetch things and items concurrently
+    const [things] = await Promise.all([this.getThings(), this.getItems()]);
 
     const issues: string[] = [];
     const connectivity: string[] = [];
@@ -1235,14 +1884,19 @@ export class OpenHabClient {
         issues.push(`Device OFFLINE: ${t.label || t.UID} (${t.statusInfo?.status})`);
       });
 
-    // Battery check (semantic point search)
-    items
-      .filter((i) => i.name.toLowerCase().includes('battery') || i.tags?.includes('LowBattery'))
-      .forEach((i) => {
-        if (parseFloat(i.state) < 20 || i.state === 'ON') {
-          issues.push(`Low Battery Alert: ${i.label || i.name} (${i.state})`);
-        }
-      });
+    // Battery check — index is already warm from the concurrent fetch above
+    const idx = this.semanticIndex;
+    const battCandidates = new Set<string>([
+      ...(idx.byTag.get('lowbattery') ?? []),
+      ...(idx.byToken.get('battery') ?? []),
+    ]);
+    for (const name of battCandidates) {
+      const i = idx.itemMap.get(name);
+      if (!i) continue;
+      if (parseFloat(i.state) < 20 || i.state === 'ON') {
+        issues.push(`Low Battery Alert: ${i.label ?? i.name} (${i.state})`);
+      }
+    }
 
     return {
       criticalIssues: issues,
@@ -1254,15 +1908,11 @@ export class OpenHabClient {
    * Predictive rule generation from natural language intent.
    */
   async generateRuleFromNL(intent: string): Promise<Partial<OpenHabRule>> {
-    const items = await this.getItems();
+    // Use resolveItem (semantic index) instead of O(n) substring scan
+    const matches = await this.resolveItem(intent);
+    const topMatch = matches[0];
+    const targetItem = topMatch ? this.semanticIndex.itemMap.get(topMatch.name) : undefined;
     const lcIntent = intent.toLowerCase();
-
-    // Naive semantic matcher for rule actions
-    const targetItem = items.find(
-      (i) =>
-        lcIntent.includes(i.name.toLowerCase()) ||
-        (i.label && lcIntent.includes(i.label.toLowerCase()))
-    );
 
     const isOff = lcIntent.includes('off') || lcIntent.includes('close');
     const command = isOff ? 'OFF' : 'ON';
@@ -1296,13 +1946,16 @@ export class OpenHabClient {
 
   /**
    * Captures current state of items as a named scene.
+   * Optimization: uses getMultiItems so only the requested items are fetched (cache-aware),
+   * avoiding a full item-list download when items_all isn't already cached.
    */
   async captureScene(name: string, itemNames: string[]): Promise<string> {
-    const items = await this.getItems();
-    const sceneData = itemNames.map((itemName) => {
-      const item = items.find((i) => i.name === itemName);
-      return { itemName, command: item?.state || 'OFF' };
-    });
+    const items = await this.getMultiItems(itemNames);
+    const stateMap = new Map(items.map((i) => [i.name, i.state]));
+    const sceneData = itemNames.map((itemName) => ({
+      itemName,
+      command: stateMap.get(itemName) ?? 'OFF',
+    }));
     this.scenes.set(name, sceneData);
     return `Scene '${name}' captured with ${sceneData.length} items.`;
   }
@@ -1417,7 +2070,13 @@ config:
     // Process all channels
     if (thing.channels && thing.channels.length > 0) {
       for (const ch of thing.channels) {
-        const channel: any = ch;
+        const channel = ch as {
+          kind?: string;
+          id: string;
+          uid?: string;
+          itemType?: string;
+          label?: string;
+        };
         if (channel.kind !== 'STATE') continue;
 
         const channelId = channel.id.replace(/[^a-zA-Z0-9_]/g, '');
@@ -1456,8 +2115,10 @@ config:
           results.push(`Created Item: ${itemName} (${itemType})`);
 
           // Link Item to Channel
-          await this.linkItemToChannel(itemName, channel.uid);
-          results.push(`Linked ${itemName} to ${channel.uid}`);
+          if (channel.uid) {
+            await this.linkItemToChannel(itemName, channel.uid);
+            results.push(`Linked ${itemName} to ${channel.uid}`);
+          }
         }
       }
     }
@@ -1480,10 +2141,14 @@ config:
         try {
           const obj = JSON.parse(value);
           const parts = pattern.replace('$.', '').split('.');
-          let current: any = obj;
+          let current: unknown = obj;
           for (const p of parts) {
-            if (current && p in current) {
-              current = current[p];
+            if (
+              current &&
+              typeof current === 'object' &&
+              p in (current as Record<string, unknown>)
+            ) {
+              current = (current as Record<string, unknown>)[p];
             } else {
               return 'Null/No Match';
             }
@@ -1503,9 +2168,12 @@ config:
    * The "System Janitor": Finds orphan items and broken links.
    */
   async findOrphansAndBrokenLinks(): Promise<{ orphans: string[]; brokenLinks: string[] }> {
-    const items = await this.getItems();
-    const links = await this.getLinks();
-    const things = await this.getThings();
+    // All three are independent — fetch in parallel
+    const [items, links, things] = await Promise.all([
+      this.getItems(),
+      this.getLinks(),
+      this.getThings(),
+    ]);
 
     const thingUIDs = new Set(things.map((t) => t.UID));
     const itemNames = new Set(items.map((i) => i.name));
@@ -1546,11 +2214,14 @@ config:
    * The "Forensic Investigator": Comprehensive state history and rule influences
    */
   async explainItemState(itemName: string): Promise<Record<string, unknown>> {
-    const item = await this.getItem(itemName);
-    const links = await this.getLinks(itemName);
-    const rules = await this.getRules();
+    // Optimization: fetch item, links, and rules concurrently
+    const [item, links, rules] = await Promise.all([
+      this.getItem(itemName),
+      this.getLinks(itemName),
+      this.getRules(),
+    ]);
 
-    let history: any = { message: 'No history found' };
+    let history: unknown = { message: 'No history found' };
     try {
       const histData = await this.getItemPersistenceData(itemName);
       if (histData.data && histData.data.length > 0) {
@@ -1564,16 +2235,16 @@ config:
     const affectingRules = rules
       .filter((r) => {
         // Check triggers
-        const inTrigger = r.triggers?.some((t: any) =>
-          JSON.stringify(t.configuration).includes(itemName)
+        const inTrigger = r.triggers?.some((t: unknown) =>
+          JSON.stringify((t as Record<string, unknown>).configuration).includes(itemName)
         );
         // Check actions/scripts
-        const inAction = r.actions?.some((a: any) =>
-          JSON.stringify(a.configuration).includes(itemName)
+        const inAction = r.actions?.some((a: unknown) =>
+          JSON.stringify((a as Record<string, unknown>).configuration).includes(itemName)
         );
         // Check conditions
-        const inCondition = r.conditions?.some((c: any) =>
-          JSON.stringify(c.configuration).includes(itemName)
+        const inCondition = r.conditions?.some((c: unknown) =>
+          JSON.stringify((c as Record<string, unknown>).configuration).includes(itemName)
         );
         return inTrigger || inAction || inCondition;
       })
@@ -1610,17 +2281,56 @@ config:
    */
   async getHistoricalLogs(lines: number = 500, search?: string): Promise<string[]> {
     if (this.eventLogBuffer.length === 0) {
-      return ['No events buffered. Historical logs require the MCP server to be running and connected to SSE.'];
+      return [
+        'No events buffered. Historical logs require the MCP server to be running and connected to SSE.',
+      ];
     }
 
     let logs = this.eventLogBuffer;
     if (search) {
       const query = search.toLowerCase();
-      logs = logs.filter(l => l.toLowerCase().includes(query));
+      logs = logs.filter((l) => l.toLowerCase().includes(query));
     }
 
     const safeLines = Math.min(lines, this.MAX_LOG_BUFFER);
     return logs.slice(-safeLines);
+  }
+
+  /**
+   * Mastery Tool: Searches the actual log files on the filesystem if available.
+   * This is much faster and more comprehensive than the SSE buffer.
+   */
+  async searchLogs(
+    query: string,
+    logType: 'openhab' | 'events' = 'events',
+    maxResults: number = 100
+  ): Promise<string[]> {
+    if (!this.logFolderPath) {
+      return [
+        'Log folder path is not configured.',
+        'Please provide the path to the OpenHAB log folder using the set_log_folder tool.',
+        'This can be a local path (e.g. /var/log/openhab) or a mounted network share.',
+      ];
+    }
+
+    const fileName = logType === 'events' ? 'events.log' : 'openhab.log';
+    const filePath = path.join(this.logFolderPath, fileName);
+
+    if (!fs.existsSync(filePath)) {
+      return [`Log file ${fileName} not found in ${this.logFolderPath}`];
+    }
+
+    // Since we're in a Node process, we'll read the last 5000 lines and filter
+    const lines = await readLastLines(filePath, 5000);
+    const searchLower = query.toLowerCase();
+
+    let results = lines.filter((l) => l.toLowerCase().includes(searchLower));
+
+    if (logType === 'events') {
+      results = results.map((l) => normalizeEventLog(l) || l);
+    }
+
+    return results.slice(-maxResults);
   }
 
   /**
@@ -1641,30 +2351,44 @@ config:
 
   /**
    * Advanced Remediation: Mass-update item metadata, tags, and groups.
+   * Optimization: batch-fetches all target items via getMultiItems (one HTTP call or
+   * cache hits) then fans out update requests concurrently.
    */
   async bulkItemRemediation(
     itemNames: string[],
     updates: { tags?: string[]; category?: string; groupNames?: string[] }
   ): Promise<string[]> {
-    const results: string[] = [];
-    for (const itemName of itemNames) {
-      try {
-        const item = await this.getItem(itemName);
-        const newData = { ...item };
-        if (updates.tags)
-          newData.tags = Array.from(new Set([...(newData.tags || []), ...updates.tags]));
-        if (updates.category) newData.category = updates.category;
-        if (updates.groupNames)
-          newData.groupNames = Array.from(
-            new Set([...(newData.groupNames || []), ...updates.groupNames])
-          );
-
-        await this.createOrUpdateItem(itemName, newData);
-        results.push(`Updated ${itemName}`);
-      } catch (e: any) {
-        results.push(`Error updating ${itemName}: ${e.message}`);
-      }
+    // Single batch fetch instead of N sequential getItem() calls
+    let fetched: OpenHabItem[];
+    try {
+      fetched = await this.getMultiItems(itemNames);
+    } catch (e: unknown) {
+      return [`Batch fetch failed: ${e instanceof Error ? e.message : String(e)}`];
     }
+
+    const fetchedMap = new Map(fetched.map((i) => [i.name, i]));
+
+    // Fan out update requests concurrently
+    const results = await Promise.all(
+      itemNames.map(async (itemName) => {
+        try {
+          const item = fetchedMap.get(itemName);
+          if (!item) return `Error: item '${itemName}' not found.`;
+          const newData = { ...item };
+          if (updates.tags)
+            newData.tags = Array.from(new Set([...(newData.tags || []), ...updates.tags]));
+          if (updates.category) newData.category = updates.category;
+          if (updates.groupNames)
+            newData.groupNames = Array.from(
+              new Set([...(newData.groupNames || []), ...updates.groupNames])
+            );
+          await this.createOrUpdateItem(itemName, newData);
+          return `Updated ${itemName}`;
+        } catch (e: unknown) {
+          return `Error updating ${itemName}: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      })
+    );
     return results;
   }
 
@@ -1672,8 +2396,11 @@ config:
    * Advanced Remediation: Simple correlation discovery in persistence history.
    */
   async discoverAutomationPatterns(itemName: string, correlatedItemName: string): Promise<string> {
-    const dataA = await this.getItemPersistenceData(itemName);
-    const dataB = await this.getItemPersistenceData(correlatedItemName);
+    // Both persistence fetches are independent — run in parallel
+    const [dataA, dataB] = await Promise.all([
+      this.getItemPersistenceData(itemName),
+      this.getItemPersistenceData(correlatedItemName),
+    ]);
 
     if (!dataA.data || !dataB.data || dataA.data.length < 5 || dataB.data.length < 5) {
       return 'Insufficient data for correlation analysis.';
@@ -1698,20 +2425,21 @@ config:
    * Advanced Remediation: Audit the semantic model for orphans and structural gaps.
    */
   async auditSemanticModel(): Promise<{ gaps: string[]; recommendations: string[] }> {
-    const items = await this.getItems();
+    await this.getItems(); // ensure index
+    const idx = this.semanticIndex;
     const gaps: string[] = [];
     const recommendations: string[] = [];
 
-    items.forEach((i) => {
+    for (const [, i] of idx.itemMap) {
       const isEquipment = i.tags?.some(
         (t) => t.toLowerCase() === 'equipment' || t.includes('Equipment_')
       );
       const isPoint = i.tags?.some((t) => t.toLowerCase() === 'point' || t.includes('Point_'));
 
-      // Check Equipment has a parent Location
+      // Check Equipment has a parent Location — O(1) itemMap lookup per group name
       if (isEquipment) {
         const hasLocationParent = i.groupNames?.some((gName) => {
-          const g = items.find((item) => item.name === gName);
+          const g = idx.itemMap.get(gName);
           return g?.tags?.some((t) => t.toLowerCase() === 'location' || t.includes('Location_'));
         });
         if (!hasLocationParent) {
@@ -1721,14 +2449,11 @@ config:
       }
 
       // Check Point has a parent Equipment or Location
-      if (isPoint) {
-        const hasParent = i.groupNames && i.groupNames.length > 0;
-        if (!hasParent) {
-          gaps.push(`Point '${i.name}' is top-level (no parent).`);
-          recommendations.push(`Link '${i.name}' to its parent Equipment or Location.`);
-        }
+      if (isPoint && (!i.groupNames || i.groupNames.length === 0)) {
+        gaps.push(`Point '${i.name}' is top-level (no parent).`);
+        recommendations.push(`Link '${i.name}' to its parent Equipment or Location.`);
       }
-    });
+    }
 
     return { gaps, recommendations };
   }
@@ -1841,8 +2566,8 @@ blocks:
                     - component: oh-label-card
                       config:
                         title: Generated from legacy sitemap ${sitemapName}`;
-    } catch (e: any) {
-      return `Error converting sitemap: ${e.message}`;
+    } catch (e: unknown) {
+      return `Error converting sitemap: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
@@ -1860,11 +2585,15 @@ blocks:
 
   /**
    * Mastery Tool: Exports a lightweight JSON snapshot of the system configuration.
+   * Returns counts + slim projections instead of raw arrays to stay token-efficient.
+   * Full raw data is available individually via query_items/query_things/manage_link.
    */
   async exportSystemSnapshot(): Promise<string> {
-    const items = await this.getItems();
-    const things = await this.getThings();
-    const links = await this.getLinks();
+    const [items, things, links] = await Promise.all([
+      this.getItems(),
+      this.getThings(),
+      this.getLinks(),
+    ]);
 
     const snapshot = {
       timestamp: new Date().toISOString(),
@@ -1874,16 +2603,19 @@ blocks:
         things: things.length,
         links: links.length,
       },
-      data: { items, things, links },
+      // Slim projections — names/types/states only (no metadata, no channels)
+      items: items.map((i) => ({ name: i.name, type: i.type, state: i.state, label: i.label })),
+      things: things.map((t) => ({ uid: t.UID, label: t.label, status: t.statusInfo?.status })),
+      links: links.map((l) => ({ item: l.itemName, channel: l.channelUID })),
     };
 
-    return JSON.stringify(snapshot, null, 2);
+    return JSON.stringify(snapshot);
   }
 
   /**
    * Mastery Tool: Returns observability metrics for the MCP server.
    */
-  getMcpHealth(): any {
+  getMcpHealth(): Record<string, unknown> {
     return {
       status: 'OK',
       capabilities: ['SSE', 'Caching', 'FuzzySearch', 'Simulation', 'SemanticAudit'],
@@ -1906,11 +2638,11 @@ blocks:
     itemName: string,
     startTime: string,
     endTime: string
-  ): Promise<any> {
+  ): Promise<Record<string, unknown>> {
     const data = await this.getItemPersistenceData(itemName, undefined, startTime, endTime);
     if (!data || !data.data || data.data.length === 0) return { error: 'No data found in range.' };
 
-    const values = data.data.map((p: any) => parseFloat(p.state)).filter((v: any) => !isNaN(v));
+    const values = data.data.map((p) => parseFloat(p.state)).filter((v) => !isNaN(v));
     if (values.length === 0)
       return { count: data.data.length, info: 'No numeric values to summarize.' };
 
@@ -1965,10 +2697,11 @@ blocks:
 
   /**
    * Ultimate Tool: Predicts the effect of a command without executing it on hardware.
+   * Optimization: fetches item state and rule list concurrently.
    */
-  async simulateSystemState(itemName: string, command: string): Promise<any> {
-    const item = await this.getItem(itemName);
-    const rules = await this.getRules();
+  async simulateSystemState(itemName: string, command: string): Promise<Record<string, unknown>> {
+    // item and rules are independent — fetch in parallel
+    const [item, rules] = await Promise.all([this.getItem(itemName), this.getRules()]);
 
     const affectedRules = rules.filter((r) => {
       const triggers = JSON.stringify(r.triggers);
@@ -1993,40 +2726,76 @@ blocks:
 
   /**
    * Ultimate Tool: Generates a complete Markdown guide of the current OpenHAB setup.
+   * Optimization: fetches items and rules concurrently.
+   * Room detection uses proper semantic Location tags (any item tagged with a word
+   * containing 'location') rather than a hard-coded list of room names.
    */
   async generateHomeBlueprint(): Promise<string> {
-    const items = await this.getItems();
-    const rules = await this.getRules();
+    // Fetch items (warm/rebuild index) and rules concurrently
+    const [, rules] = await Promise.all([this.getItems(), this.getRules()]);
+    const idx = this.semanticIndex;
 
     let blueprint = '# OpenHAB Home Blueprint\n\n';
     blueprint += `Generated: ${new Date().toLocaleString()}\n\n`;
 
-    // Summary
     blueprint += '## System Overview\n';
-    blueprint += `- Total Items: ${items.length}\n`;
-    blueprint += `- Total Rules: ${rules.length}\n\n`;
+    blueprint += `- Total Items: ${idx.itemMap.size}\n`;
+    blueprint += `- Total Rules: ${rules.length}\n`;
+    blueprint += `- Rooms: ${idx.rooms.length}\n\n`;
 
-    // High level Rooms
-    const rooms = Array.from(
-      new Set(
-        items
-          .flatMap((i) => i.tags || [])
-          .filter((t) => t.startsWith('Room_') || ['Lounge', 'Kitchen', 'Bedroom'].includes(t))
-      )
-    );
+    // Use the pre-built index instead of repeated O(n) filter calls inside a loop
     blueprint += '## Spatial Model\n';
-    rooms.forEach((room) => {
-      const roomItems = items.filter((i) => i.tags?.includes(room));
-      blueprint += `### ${room.replace('Room_', '')}\n`;
-      blueprint += `- Devices: ${roomItems.length}\n`;
-      blueprint +=
-        roomItems
+    for (const room of idx.rooms) {
+      const roomLabel = room.label ?? room.name;
+      const directChildNames = idx.byRoom.get(room.name.toLowerCase()) ?? new Set<string>();
+      const directChildren = Array.from(directChildNames)
+        .map((n) => idx.itemMap.get(n)!)
+        .filter(Boolean);
+
+      const equipment = directChildren.filter(
+        (i) => i.type === 'Group' || i.tags?.some((t) => t.toLowerCase().includes('equipment'))
+      );
+      const standalone = directChildren.filter(
+        (i) => i.type !== 'Group' && !i.tags?.some((t) => t.toLowerCase().includes('equipment'))
+      );
+
+      blueprint += `### ${roomLabel}\n`;
+      blueprint += `- Equipment: ${equipment.length}, Standalone items: ${standalone.length}\n`;
+
+      for (const eq of equipment) {
+        // Use byRoom map lookup instead of items.filter()
+        const pointNames = idx.byRoom.get(eq.name.toLowerCase()) ?? new Set<string>();
+        const points = Array.from(pointNames)
+          .map((n) => idx.itemMap.get(n))
+          .filter((p): p is OpenHabItem => !!p && p.type !== 'Group');
+        blueprint += `  - **${eq.label ?? eq.name}** (${eq.type})`;
+        if (points.length) blueprint += `: ${points.map((p) => p.label ?? p.name).join(', ')}`;
+        blueprint += '\n';
+      }
+
+      if (standalone.length) {
+        blueprint += standalone
           .slice(0, 5)
-          .map((i) => `  - ${i.label || i.name}`)
-          .join('\n') +
-        (roomItems.length > 5 ? '\n  - ...' : '') +
-        '\n\n';
-    });
+          .map((i) => `  - ${i.label ?? i.name}: ${i.state}`)
+          .join('\n');
+        if (standalone.length > 5) blueprint += `\n  - … (+${standalone.length - 5} more)`;
+        blueprint += '\n';
+      }
+      blueprint += '\n';
+    }
+
+    // Active states — use pre-indexed byType and byTag instead of scanning all items
+    const active: string[] = [];
+    for (const [, item] of idx.itemMap) {
+      if (item.state === 'ON' || item.state === 'OPEN') active.push(item.label ?? item.name);
+    }
+    if (active.length) {
+      blueprint += `## Currently Active (${active.length})\n`;
+      const shown = active.slice(0, 60);
+      blueprint += shown.map((n) => `- ${n}`).join('\n') + '\n';
+      if (active.length > 60) blueprint += `- … +${active.length - 60} more\n`;
+      blueprint += '\n';
+    }
 
     return blueprint;
   }
@@ -2034,7 +2803,7 @@ blocks:
   /**
    * Ultimate Tool: Audits security-sensitive items for misconfiguration.
    */
-  async auditSystemSafety(): Promise<any> {
+  async auditSystemSafety(): Promise<Record<string, unknown>> {
     const items = await this.getItems();
     const issues: string[] = [];
 
@@ -2067,7 +2836,7 @@ blocks:
   /**
    * Ultimate Tool: Aggregates power and energy data into an efficiency report.
    */
-  async calculateEnergyInsights(): Promise<any> {
+  async calculateEnergyInsights(): Promise<Record<string, unknown>> {
     const items = await this.getItems();
     const energyItems = items.filter(
       (i) =>
@@ -2096,7 +2865,7 @@ blocks:
    * Enhancement: Triggers a manual discovery scan for a specific binding.
    */
   async triggerDiscoveryScan(bindingId: string): Promise<string> {
-    const response = await this.client.post(`/rest/discovery/bindings/${bindingId}/scan`);
+    await this.client.post(`/rest/discovery/bindings/${bindingId}/scan`);
     return `Discovery scan triggered for binding: ${bindingId}. Check the inbox for new items.`;
   }
 
@@ -2104,26 +2873,25 @@ blocks:
    * Enhancement: Returns the full semantic path for an item (e.g., Lounge > Sofa > Light).
    */
   async getSemanticPath(itemName: string): Promise<string> {
-    const allItems = await this.getItems();
-    const item = allItems.find((i) => i.name === itemName);
+    await this.getItems(); // ensure index
+    const idx = this.semanticIndex;
+    const item = idx.itemMap.get(itemName);
     if (!item) throw new Error(`Item ${itemName} not found.`);
 
-    const path: string[] = [item.label || item.name];
+    const path: string[] = [item.label ?? item.name];
     let current = item;
 
-    // Traverse upwards through groups
+    // Traverse upwards via itemMap O(1) lookups instead of O(n) allItems.find()
     while (current.groupNames && current.groupNames.length > 0) {
-      // Find a parent that is part of the semantic model
-      const parent = allItems.find(
-        (i) =>
-          current.groupNames.includes(i.name) &&
-          i.tags?.some((t) =>
-            ['Location', 'Equipment', 'Point'].some((s) => t.toLowerCase().includes(s.toLowerCase()))
+      const parent = current.groupNames
+        .map((g) => idx.itemMap.get(g))
+        .find((p) =>
+          p?.tags?.some((t) =>
+            ['location', 'equipment', 'point'].some((s) => t.toLowerCase().includes(s))
           )
-      );
-
+        );
       if (!parent) break;
-      path.unshift(parent.label || parent.name);
+      path.unshift(parent.label ?? parent.name);
       current = parent;
     }
 
@@ -2134,36 +2902,20 @@ blocks:
    * Enhancement: Finds equipment/points in the same location as the target item.
    */
   async findNeighboringEquipment(itemName: string): Promise<OpenHabItem[]> {
-    const allItems = await this.getItems();
-    const item = allItems.find((i) => i.name === itemName);
+    await this.getItems(); // ensure index
+    const idx = this.semanticIndex;
+    const item = idx.itemMap.get(itemName);
     if (!item) throw new Error(`Item ${itemName} not found.`);
 
-    // Find the closest location parent
-    let locationParent: OpenHabItem | undefined;
-    let current = item;
+    // Use pre-built transitive map — O(1) lookup instead of multi-level upward traversal
+    const roomName = idx.itemToRoom.get(itemName);
+    if (!roomName) return [];
 
-    while (current.groupNames && current.groupNames.length > 0) {
-      const parent = allItems.find(
-        (i) =>
-          current.groupNames.includes(i.name) &&
-          i.tags?.some((t) => t.toLowerCase().includes('location'))
-      );
-      if (parent) {
-        locationParent = parent;
-        break;
-      }
-      // If no location parent yet, try next group level
-      const nextParent = allItems.find((i) => current.groupNames.includes(i.name));
-      if (!nextParent) break;
-      current = nextParent;
-    }
-
-    if (!locationParent) return [];
-
-    // Find all items that share this location parent
-    return allItems.filter(
-      (i) => i.name !== itemName && i.groupNames?.includes(locationParent!.name)
-    );
+    // Return every item assigned to the same room (all depths), excluding self
+    return Array.from(idx.itemToRoom.entries())
+      .filter(([n, r]) => n !== itemName && r === roomName)
+      .map(([n]) => idx.itemMap.get(n)!)
+      .filter(Boolean);
   }
 
   /**
@@ -2179,8 +2931,10 @@ blocks:
       try {
         await this.sendCommand(itemName, command);
         this.log(`SCHEDULER: Executed scheduled command ${command} on ${itemName}`);
-      } catch (err: any) {
-        this.log(`SCHEDULER ERROR: Failed to execute command on ${itemName}: ${err.message}`);
+      } catch (err: unknown) {
+        this.log(
+          `SCHEDULER ERROR: Failed to execute command on ${itemName}: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }, delayMs);
 
@@ -2201,10 +2955,16 @@ blocks:
       // or check the event logs if we have them.
       // Since standard REST items don't have a 'lastUpdate' field without persistence,
       // we check our event logs first.
-      const lastLog = this.eventLogBuffer
-        .reverse()
-        .find((l) => l.includes(`ItemStateChangedEvent - ${i.name}`));
-      this.eventLogBuffer.reverse(); // Restore original order
+      // Optimization: avoid O(n²) repeated in-place reverse() inside a forEach loop;
+      // iterate backwards without mutating the array.
+      const target = `ItemStateChangedEvent - ${i.name}`;
+      let lastLog: string | undefined;
+      for (let idx = this.eventLogBuffer.length - 1; idx >= 0; idx--) {
+        if (this.eventLogBuffer[idx].includes(target)) {
+          lastLog = this.eventLogBuffer[idx];
+          break;
+        }
+      }
 
       if (lastLog) {
         const logTime = new Date(lastLog.split(' - ')[0]).getTime();
@@ -2220,5 +2980,53 @@ blocks:
     });
 
     return stale;
+  }
+
+  /**
+   * Enhancement: Rapidly audits all items exposed to voice assistants (Google/Alexa).
+   * Correlates items with their room and equipment for human-readable reporting.
+   */
+  async auditVoiceExposure(): Promise<Record<string, unknown>[]> {
+    // Must request metadata explicitly — voice assistant config lives in metadata namespaces
+    // (ga, alexa, googlehome, etc.) which are not included in the default slim fetch.
+    const metaItems = await this.getItems(undefined, undefined, '.*');
+    const idx = this.semanticIndex; // still valid for room/equipment lookups
+    const roomLabelOf = new Map(idx.rooms.map((r) => [r.name, r.label ?? r.name]));
+    const exposed: Record<string, unknown>[] = [];
+
+    // Iterate the metadata-inclusive list, not the slim semantic index itemMap
+    for (const item of metaItems) {
+      if (!item.metadata) continue;
+
+      const ga = item.metadata.ga || item.metadata.googlehome || item.metadata.googleassistant;
+      const alexa = item.metadata.alexa;
+
+      if (!ga && !alexa) continue;
+
+      // Use pre-built transitive maps — O(1) per item, no linear scan
+      const roomName = idx.itemToRoom.get(item.name);
+      const equipName = idx.itemToEquipment.get(item.name);
+      const equipItem = equipName ? idx.itemMap.get(equipName) : undefined;
+
+      const gaEntry = ga as { value?: unknown; config?: Record<string, unknown> };
+      const alexaEntry = alexa as { value?: unknown };
+      exposed.push({
+        itemName: item.name,
+        label: item.label,
+        type: item.type,
+        room: roomName ? (roomLabelOf.get(roomName) ?? roomName) : 'Unknown',
+        equipment: equipItem ? (equipItem.label ?? equipItem.name) : 'None',
+        googleHome: ga
+          ? {
+              type: gaEntry.value,
+              name: (gaEntry.config?.name as string | undefined) ?? item.label,
+              room: gaEntry.config?.roomHint,
+            }
+          : null,
+        alexa: alexa ? { type: alexaEntry.value } : null,
+      });
+    }
+
+    return exposed;
   }
 }

@@ -1,9 +1,5 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
 import { OpenHabClient } from './openhab-client.js';
 import { registerTools } from './tools.js';
 
@@ -21,245 +17,183 @@ async function main() {
   }
 
   // Set up MCP Server
-  const server = new Server(
+  const server = new McpServer(
     { name: 'openhab-mcp', version: '1.0.0' },
-    { capabilities: { tools: {}, resources: { subscribe: true } } }
+    { capabilities: { resources: { subscribe: true }, tools: {} } }
   );
 
   // Initialize Client
   const client = new OpenHabClient(openhabUrl, apiToken);
 
-  // Register Resources
-  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-    resources: [
-      {
-        uri: 'openhab://items',
-        name: 'OpenHAB Items',
-        mimeType: 'application/json',
-        description: 'A list of all items and their current states',
-      },
-      {
-        uri: 'openhab://things',
-        name: 'OpenHAB Things',
-        mimeType: 'application/json',
-        description: 'A list of all configured things and their status',
-      },
-      {
-        uri: 'openhab://discovery',
-        name: 'OpenHAB Discovery Inbox',
-        mimeType: 'application/json',
-        description: 'A list of discovered but unconfigured things in the inbox',
-      },
-      {
-        uri: 'openhab://summary',
-        name: 'OpenHAB System Summary',
-        mimeType: 'application/json',
-        description: 'A token-efficient overview of the system state for LLM context optimization',
-      },
-      {
-        uri: 'openhab://schema',
-        name: 'OpenHAB Item Schema',
-        mimeType: 'application/json',
-        description: 'Ultra-minimal list of item names and types for zero-token discovery',
-      },
-      {
-        uri: 'openhab://prompt-context',
-        name: 'OpenHAB AI Prompt Context',
-        mimeType: 'text/markdown',
-        description:
-          'Pre-baked system prompt fragment to prime any AI agent for this specific home',
-      },
-    ],
-  }));
+  // --- Static Resources ---
 
-  // Register Resource Templates
-  server.setRequestHandler(ListResourcesRequestSchema, async (_request, _extra) => {
-    // Note: The SDK might handle ListResources and ResourceTemplates differently
-    // depending on version, but adding them to the list is standard.
-    return {
-      resources: [
-        {
-          uri: 'openhab://items',
-          name: 'OpenHAB Items',
-          mimeType: 'application/json',
-        },
-        {
-          uri: 'openhab://things',
-          name: 'OpenHAB Things',
-          mimeType: 'application/json',
-        },
-        {
-          uri: 'openhab://discovery',
-          name: 'OpenHAB Discovery Inbox',
-          mimeType: 'application/json',
-        },
-        {
-          uri: 'openhab://summary',
-          name: 'OpenHAB System Summary',
-          mimeType: 'application/json',
-        },
-        {
-          uri: 'openhab://schema',
-          name: 'OpenHAB Item Schema',
-          mimeType: 'application/json',
-        },
-        {
-          uri: 'openhab://prompt-context',
-          name: 'OpenHAB AI Prompt Context',
-          mimeType: 'text/markdown',
-        },
-        {
-          uri: 'openhab://visual/charts/{item}',
-          name: 'Item Visual Telemetry',
-          description: "ASCII Sparkline representation of an item's recent historical trend.",
-          mimeType: 'text/markdown',
-        },
-      ],
-      resourceTemplates: [
-        {
-          uriTemplate: 'openhab://items/{name}',
-          name: 'Specific OpenHAB Item',
-          mimeType: 'application/json',
-          description: 'Access a single item by its name',
-        },
-        {
-          uriTemplate: 'openhab://things/{uid}',
-          name: 'Specific OpenHAB Thing',
-          mimeType: 'application/json',
-          description: 'Access a single thing by its UID',
-        },
-        {
-          uriTemplate: 'openhab://visual/charts/{item}',
-          name: 'Item Visual Telemetry',
-          mimeType: 'text/markdown',
-          description: 'ASCII Sparkline trend analysis for an item',
-        },
-      ],
-    };
-  });
-
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-    if (request.params.uri === 'openhab://items') {
+  server.registerResource(
+    'OpenHAB Items',
+    'openhab://items',
+    { description: 'A list of all items and their current states', mimeType: 'application/json' },
+    async (_uri) => {
       const items = await client.getItems();
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: 'openhab://items',
             mimeType: 'application/json',
-            text: JSON.stringify(items, null, 2),
+            text: JSON.stringify(items),
           },
         ],
       };
     }
-    if (request.params.uri === 'openhab://things') {
+  );
+
+  server.registerResource(
+    'OpenHAB Things',
+    'openhab://things',
+    {
+      description: 'A list of all configured things and their status',
+      mimeType: 'application/json',
+    },
+    async (_uri) => {
       const things = await client.getThings();
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: 'openhab://things',
             mimeType: 'application/json',
-            text: JSON.stringify(things, null, 2),
+            text: JSON.stringify(things),
           },
         ],
       };
     }
-    if (request.params.uri === 'openhab://discovery') {
+  );
+
+  server.registerResource(
+    'OpenHAB Discovery Inbox',
+    'openhab://discovery',
+    {
+      description: 'A list of discovered but unconfigured things in the inbox',
+      mimeType: 'application/json',
+    },
+    async (_uri) => {
       const inbox = await client.getInbox();
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: 'openhab://discovery',
             mimeType: 'application/json',
-            text: JSON.stringify(inbox, null, 2),
+            text: JSON.stringify(inbox),
           },
         ],
       };
     }
-    if (request.params.uri === 'openhab://summary') {
+  );
+
+  server.registerResource(
+    'OpenHAB System Summary',
+    'openhab://summary',
+    {
+      description: 'A token-efficient overview of the system state for LLM context optimization',
+      mimeType: 'application/json',
+    },
+    async (_uri) => {
       const summary = await client.getSystemSummary();
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: 'openhab://summary',
             mimeType: 'application/json',
-            text: JSON.stringify(summary, null, 2),
+            text: JSON.stringify(summary),
           },
         ],
       };
     }
-    if (request.params.uri === 'openhab://schema') {
+  );
+
+  server.registerResource(
+    'OpenHAB Item Schema',
+    'openhab://schema',
+    {
+      description: 'Ultra-minimal list of item names and types for zero-token discovery',
+      mimeType: 'application/json',
+    },
+    async (_uri) => {
       const schema = await client.getSchema();
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: 'openhab://schema',
             mimeType: 'application/json',
-            text: JSON.stringify(schema, null, 2),
+            text: JSON.stringify(schema),
           },
         ],
       };
     }
-    if (request.params.uri === 'openhab://prompt-context') {
+  );
+
+  server.registerResource(
+    'OpenHAB AI Prompt Context',
+    'openhab://prompt-context',
+    {
+      description: 'Pre-baked system prompt fragment to prime any AI agent for this specific home',
+      mimeType: 'text/markdown',
+    },
+    async (_uri) => {
       const context = await client.getPromptContext();
       return {
-        contents: [
-          {
-            uri: request.params.uri,
-            mimeType: 'text/markdown',
-            text: context,
-          },
-        ],
+        contents: [{ uri: 'openhab://prompt-context', mimeType: 'text/markdown', text: context }],
       };
     }
+  );
 
-    // Handle Templates
-    const itemMatch = request.params.uri.match(/^openhab:\/\/items\/(.+)$/);
-    if (itemMatch) {
-      const itemName = itemMatch[1];
+  // --- Resource Templates ---
+
+  server.registerResource(
+    'Specific OpenHAB Item',
+    new ResourceTemplate('openhab://items/{name}', { list: undefined }),
+    { description: 'Access a single item by its name', mimeType: 'application/json' },
+    async (uri, variables) => {
+      const itemName = String(variables.name);
       const item = await client.getItem(itemName);
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: uri.toString(),
             mimeType: 'application/json',
-            text: JSON.stringify(item, null, 2),
+            text: JSON.stringify(item),
           },
         ],
       };
     }
+  );
 
-    const thingMatch = request.params.uri.match(/^openhab:\/\/things\/(.+)$/);
-    if (thingMatch) {
-      const thingUID = thingMatch[1];
+  server.registerResource(
+    'Specific OpenHAB Thing',
+    new ResourceTemplate('openhab://things/{uid}', { list: undefined }),
+    { description: 'Access a single thing by its UID', mimeType: 'application/json' },
+    async (uri, variables) => {
+      const thingUID = String(variables.uid);
       const thing = await client.getThing(thingUID);
       return {
         contents: [
           {
-            uri: request.params.uri,
+            uri: uri.toString(),
             mimeType: 'application/json',
-            text: JSON.stringify(thing, null, 2),
+            text: JSON.stringify(thing),
           },
         ],
       };
     }
+  );
 
-    const chartMatch = request.params.uri.match(/^openhab:\/\/visual\/charts\/(.+)$/);
-    if (chartMatch) {
-      const itemName = chartMatch[1];
+  server.registerResource(
+    'Item Visual Telemetry',
+    new ResourceTemplate('openhab://visual/charts/{item}', { list: undefined }),
+    { description: 'ASCII Sparkline trend analysis for an item', mimeType: 'text/markdown' },
+    async (uri, variables) => {
+      const itemName = String(variables.item);
       const chart = await client.getVisualChart(itemName);
-      return {
-        contents: [
-          {
-            uri: request.params.uri,
-            mimeType: 'text/markdown',
-            text: chart,
-          },
-        ],
-      };
+      return { contents: [{ uri: uri.toString(), mimeType: 'text/markdown', text: chart }] };
     }
-
-    throw new Error(`Resource not found: ${request.params.uri}`);
-  });
+  );
 
   // Register Tools
   registerTools(server, client);
@@ -268,7 +202,10 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.error(`OpenHAB MCP Server started successfully connected to ${openhabUrl}`);
+  // This appears immediately in the client — before the background warm-up finishes
+  console.error(
+    `[OpenHAB MCP] Server connected to ${openhabUrl} — cache warm-up running in background.`
+  );
 }
 
 main().catch((error) => {
