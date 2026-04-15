@@ -77,14 +77,14 @@ Add the following to your Antigravity MCP settings:
 
 ### VS Code (Roo/Cline)
 
-Add a new MCP server in your settings:
+Add an MCP server entry to your VS Code workspace settings (open **Settings (JSON)** or create `.vscode/settings.json`):
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "openhab": {
       "command": "node",
-      "args": ["dist/index.js"],
+      "args": ["${workspaceFolder}/dist/index.js"],
       "env": {
         "OPENHAB_URL": "http://openhab:8080",
         "OPENHAB_API_TOKEN": "your_openhab_token_here"
@@ -93,6 +93,57 @@ Add a new MCP server in your settings:
   }
 }
 ```
+
+Quick steps to run from VS Code:
+
+1. Install deps and build the project:
+
+```bash
+npm install
+npm run build
+```
+
+2. Start the server (Linux/macOS):
+
+```bash
+OPENHAB_URL=http://openhab:8080 OPENHAB_API_TOKEN=your_openhab_token_here npm start
+```
+
+3. For iterative development, run TypeScript in watch mode and restart the server after builds (in two terminals):
+
+```bash
+npm run dev        # keeps tsc watching
+npm start          # runs node dist/index.js (in a second terminal)
+```
+
+4. Run as a VS Code Task (example `.vscode/tasks.json`):
+
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run OpenHAB MCP",
+      "type": "shell",
+      "command": "OPENHAB_URL=http://openhab:8080 OPENHAB_API_TOKEN=your_openhab_token_here npm start",
+      "group": "build",
+      "presentation": { "reveal": "always" }
+    }
+  ]
+}
+```
+
+Note for Windows (PowerShell): set env vars before running:
+
+```powershell
+$env:OPENHAB_URL = 'http://openhab:8080'; $env:OPENHAB_API_TOKEN = 'your_openhab_token_here'; npm start
+```
+
+Tips:
+
+- Use `${workspaceFolder}/dist/index.js` in the `args` so the server is launched from your opened workspace.
+- Add the server config to **Workspace** settings (not User) if you share the repo with collaborators.
+- Use the `npm: build` task in the Command Palette (Tasks → Run Task) to compile before starting.
 
 ---
 
@@ -214,3 +265,18 @@ MIT
 ## Release 1.3.1
 
 This release (1.3.1) contains documentation updates, minor fixes, and excludes test code from published releases. See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+## Contributing
+
+Contributions are welcome. Please follow the Conventional Commits specification for commit messages so changelogs and automation remain consistent.
+
+- Commit message format: `type(scope): short description` (e.g., `fix(openhab-client): handle null response`).
+- Common types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`.
+
+Example:
+
+```
+docs(readme): add contributing guidelines and conventional commits example
+```
+
+If you're submitting a change that affects behavior, include tests under `src/__tests__/` when appropriate.
