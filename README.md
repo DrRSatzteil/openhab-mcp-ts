@@ -262,9 +262,9 @@ Tools designed to automate complex workflows and provide AI-friendly context.
 
 MIT
 
-## Release 1.3.1
+## Release 1.3.2
 
-This release (1.3.1) contains documentation updates, minor fixes, and excludes test code from published releases. See [CHANGELOG.md](CHANGELOG.md) for full details.
+This release (1.3.2) contains performance optimisations across several hot-path methods and a correctness fix for `detectRuleConflicts`. See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ## Contributing
 

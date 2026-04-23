@@ -311,8 +311,10 @@ export class OpenHabClient {
 
   private addLogToBuffer(log: string): void {
     this.eventLogBuffer.push(log);
-    if (this.eventLogBuffer.length > this.MAX_LOG_BUFFER) {
-      this.eventLogBuffer.shift(); // Keep only last MAX_LOG_BUFFER items
+    // Batch-compact instead of O(n) shift() on every push.
+    // Allow up to 100 overflow entries, then slice once to trim back to MAX_LOG_BUFFER.
+    if (this.eventLogBuffer.length > this.MAX_LOG_BUFFER + 100) {
+      this.eventLogBuffer = this.eventLogBuffer.slice(-this.MAX_LOG_BUFFER);
     }
   }
 
@@ -1335,35 +1337,36 @@ export class OpenHabClient {
     };
   }> {
     // Optimization: fetch items and things concurrently — they are independent
-    const [items, things] = await Promise.all([this.getItems(), this.getThings()]);
+    const [, things] = await Promise.all([this.getItems(), this.getThings()]);
 
-    // 1. Group items by type
+    // 1. Reuse the byType index built during getItems() — no extra O(n) pass needed
+    const idx = this.semanticIndex;
     const itemStats: Record<string, number> = {};
-    items.forEach((i) => {
-      itemStats[i.type] = (itemStats[i.type] || 0) + 1;
-    });
+    for (const [type, names] of idx.byType) {
+      itemStats[type] = names.size;
+    }
 
     // 2. Find rooms — use pre-built semantic index instead of O(n) filter
-    const rooms = this.semanticIndex.rooms.map((r) => r.label ?? r.name);
+    const rooms = idx.rooms.map((r) => r.label ?? r.name);
 
     // 3. Current "Active" states (e.g. Lights ON, Doors OPEN)
-    // Optimization: Prioritize "Smart" items like Switches and important Sensors
-    const activeStates = items
-      .filter((i) => {
-        const isSwitchOn = i.state === 'ON' || i.state === 'OPEN';
-        const isNotableNumber =
-          i.type.includes('Number') &&
-          parseFloat(i.state) > 0 &&
-          (i.name.toLowerCase().includes('temp') ||
-            i.name.toLowerCase().includes('lux') ||
-            i.name.toLowerCase().includes('battery'));
-        const isGlobalState =
-          i.name === 'Day' || i.name === 'House_Awake' || i.name.includes('_Awake');
-
-        return isSwitchOn || isNotableNumber || isGlobalState;
-      })
-      .slice(0, 30) // Increased limit for better context
-      .map((i) => `${i.label || i.name}: ${i.state}`);
+    // Iterate the semantic index itemMap — avoids keeping a separate items array reference
+    const activeStates: string[] = [];
+    for (const [, i] of idx.itemMap) {
+      if (activeStates.length >= 30) break;
+      const isSwitchOn = i.state === 'ON' || i.state === 'OPEN';
+      const isNotableNumber =
+        i.type.includes('Number') &&
+        parseFloat(i.state) > 0 &&
+        (i.name.toLowerCase().includes('temp') ||
+          i.name.toLowerCase().includes('lux') ||
+          i.name.toLowerCase().includes('battery'));
+      const isGlobalState =
+        i.name === 'Day' || i.name === 'House_Awake' || i.name.includes('_Awake');
+      if (isSwitchOn || isNotableNumber || isGlobalState) {
+        activeStates.push(`${i.label || i.name}: ${i.state}`);
+      }
+    }
 
     // 4. Offline/Error check
     const issues = things
@@ -1372,7 +1375,7 @@ export class OpenHabClient {
 
     return {
       overview: {
-        totalItems: items.length,
+        totalItems: idx.itemMap.size,
         totalThings: things.length,
         roomsFound: rooms.length,
       },
@@ -1444,7 +1447,8 @@ export class OpenHabClient {
    * Generates TypeScript interfaces for the current home system.
    */
   async generateSystemBoilerplate(): Promise<string> {
-    const items = await this.getItems();
+    await this.getItems(); // ensure semantic index is built
+    const idx = this.semanticIndex;
 
     let boilerplate = `/**
  * OpenHAB Home System Types
@@ -1453,23 +1457,22 @@ export class OpenHabClient {
 
     boilerplate += 'export type HomeItems = {\n';
 
-    items.forEach((i) => {
+    // Single pass via pre-built itemMap — avoids re-fetching the items array
+    for (const [, i] of idx.itemMap) {
       let tsType = 'string';
       if (i.type.includes('Number')) tsType = 'number';
       if (i.type === 'Switch' || i.type === 'Contact') tsType = '"ON" | "OFF" | "OPEN" | "CLOSED"';
 
       boilerplate += `  /** ${i.label || 'No label'} */\n`;
       boilerplate += `  ${i.name}: ${tsType};\n`;
-    });
+    }
 
     boilerplate += '};\n\n';
 
+    // idx.rooms is already the filtered list of Location items — no second pass needed
     boilerplate +=
       'export type RoomNames = ' +
-      items
-        .filter((i) => i.tags?.some((t) => t.toLowerCase().includes('location')))
-        .map((i) => `'${i.name}'`)
-        .join(' | ') +
+      idx.rooms.map((i) => `'${i.name}'`).join(' | ') +
       ';\n';
 
     return boilerplate;
@@ -1822,16 +1825,18 @@ export class OpenHabClient {
   async shadowRun(
     commands: Array<{ itemName: string; command: string }>
   ): Promise<Array<{ itemName: string; oldState: string; predictedState: string }>> {
+    await this.getItems(); // ensure semantic index is built
+    const idx = this.semanticIndex;
     const results = [];
-    const items = await this.getItems();
 
     for (const cmd of commands) {
-      const item = items.find((i) => i.name === cmd.itemName);
+      // O(1) map lookup instead of O(n) find()
+      const item = idx.itemMap.get(cmd.itemName);
       if (item) {
         results.push({
           itemName: cmd.itemName,
           oldState: item.state,
-          predictedState: cmd.command, // Simplification: prediction = target command
+          predictedState: cmd.command,
         });
       }
     }
@@ -1842,28 +1847,26 @@ export class OpenHabClient {
    * Generates a Mermaid topology graph for spatial reasoning.
    */
   async generateTopology(): Promise<string> {
-    const items = await this.getItems();
+    await this.getItems(); // ensure semantic index is built
+    const idx = this.semanticIndex;
     let graph = 'graph TD\n';
 
-    // Locations
-    const locations = items.filter((i) =>
-      i.tags?.some((t) => t.toLowerCase().includes('location'))
-    );
-    locations.forEach((loc) => {
+    // Use pre-built index: O(1) byRoom lookups instead of O(n) filter per location/equipment
+    for (const loc of idx.rooms) {
       graph += `  ${loc.name}["🏠 ${loc.label || loc.name}"]\n`;
-
-      // Equipment in this location
-      const equipment = items.filter((i) => i.groupNames?.includes(loc.name));
-      equipment.forEach((eq) => {
+      const childNames = idx.byRoom.get(loc.name.toLowerCase()) ?? new Set<string>();
+      for (const childName of childNames) {
+        const eq = idx.itemMap.get(childName);
+        if (!eq) continue;
         graph += `  ${loc.name} --> ${eq.name}["📦 ${eq.label || eq.name}"]\n`;
-
-        // Points for this equipment
-        const points = items.filter((i) => i.groupNames?.includes(eq.name));
-        points.forEach((p) => {
+        const pointNames = idx.byRoom.get(eq.name.toLowerCase()) ?? new Set<string>();
+        for (const pointName of pointNames) {
+          const p = idx.itemMap.get(pointName);
+          if (!p) continue;
           graph += `  ${eq.name} --> ${p.name}["📍 ${p.label || p.name}"]\n`;
-        });
-      });
-    });
+        }
+      }
+    }
 
     return graph;
   }
@@ -2462,28 +2465,33 @@ config:
    * Mastery Tool: Detects potential conflicts between rules targeting the same items.
    */
   async detectRuleConflicts(): Promise<string[]> {
-    const rules = await this.getRules();
+    // Fetch items (to warm index) and rules concurrently
+    const [rules] = await Promise.all([this.getRules(), this.getItems()]);
+    const idx = this.semanticIndex;
     const conflicts: string[] = [];
-    const itemMap = new Map<string, string[]>();
+    const itemToRules = new Map<string, string[]>();
 
-    rules.forEach((r) => {
+    for (const r of rules) {
       const actionsStr = JSON.stringify(r.actions);
-      // Heuristic: find common item names in action strings
-      const foundItems = actionsStr.match(/[a-zA-Z0-9_]{5,}/g) || [];
-      foundItems.forEach((itemName) => {
-        if (!itemMap.has(itemName)) itemMap.set(itemName, []);
-        itemMap.get(itemName)!.push(r.uid);
-      });
-    });
+      // Match against known item names only — avoids the false-positives caused by
+      // the old broad regex (/[a-zA-Z0-9_]{5,}/g) which matched every JSON property key.
+      for (const itemName of idx.itemMap.keys()) {
+        if (actionsStr.includes(itemName)) {
+          let list = itemToRules.get(itemName);
+          if (!list) { list = []; itemToRules.set(itemName, list); }
+          list.push(r.uid);
+        }
+      }
+    }
 
-    itemMap.forEach((ruleUIDs, itemName) => {
-      const uniqueRules = Array.from(new Set(ruleUIDs));
-      if (uniqueRules.length > 1) {
+    for (const [itemName, ruleUIDs] of itemToRules) {
+      const unique = [...new Set(ruleUIDs)];
+      if (unique.length > 1) {
         conflicts.push(
-          `Potential Conflict: Item '${itemName}' is targeted by multiple rules: ${uniqueRules.join(', ')}`
+          `Potential Conflict: Item '${itemName}' is targeted by ${unique.length} rules: ${unique.join(', ')}`
         );
       }
-    });
+    }
 
     return conflicts.length > 0 ? conflicts : ['No obvious rule conflicts detected.'];
   }

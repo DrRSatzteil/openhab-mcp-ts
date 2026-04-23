@@ -17,10 +17,24 @@ async function main() {
   }
 
   // Set up MCP Server
-  const server = new McpServer(
-    { name: 'openhab-mcp', version: '1.0.0' },
-    { capabilities: { resources: { subscribe: true }, tools: {} } }
-  );
+  const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' }, {
+    // Advertise explicit capabilities so MCP clients (and different LLM runtimes)
+    // can discover available resources and tool calling support. Some model
+    // implementations (e.g. newer models in VS Code) require richer capability
+    // metadata to enable tool/resource usage.
+    capabilities: {
+      resources: {
+        subscribe: true,
+        templates: true,
+        list: true,
+      },
+      tools: {
+        list: true,
+        call: true,
+        schemas: true,
+      },
+    },
+  } as any);
 
   // Initialize Client
   const client = new OpenHabClient(openhabUrl, apiToken);

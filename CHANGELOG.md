@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.2] - 2026-04-24
+
+### Performance
+
+- **`addLogToBuffer`**: Replaced O(n) `Array.shift()` per SSE event with a periodic batch-slice, eliminating linear memory moves on every event in high-activity homes.
+- **`shadowRun`**: Replaced O(n) `items.find()` with O(1) `semanticIndex.itemMap.get()` lookup.
+- **`generateTopology`**: Replaced O(n²) nested `items.filter()` loops with O(1) `byRoom`/`itemMap` index lookups (same pattern as `generateHomeBlueprint`).
+- **`getSystemSummary`**: Eliminated separate type-count loop; now reads directly from `semanticIndex.byType` map sizes built during `getItems()`.
+- **`generateSystemBoilerplate`**: Eliminated second array pass for location items; uses `semanticIndex.itemMap` and `semanticIndex.rooms` from the existing warm index.
+
+### Fixed
+
+- **`detectRuleConflicts`**: Replaced broad regex `/[a-zA-Z0-9_]{5,}/g` (which matched every JSON property name, producing large numbers of false-positive conflicts) with exact lookup against known item names from the semantic index.
+
+### Changed
+
+- **`index.ts`**: Expanded MCP capability advertisement (`resources.templates`, `resources.list`, `tools.list`, `tools.call`, `tools.schemas`) so clients that require explicit capability metadata (e.g. newer VS Code model runtimes) can discover all tools and resources.
+
 ## [1.3.0] - 2026-03-16
 
 ## [1.3.1] - 2026-03-25
