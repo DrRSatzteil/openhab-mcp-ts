@@ -281,9 +281,9 @@ describe('OpenHabClient', () => {
   describe('Expert Tools', () => {
     it('should find equipment by type in a room', async () => {
       const mockItems = [
-        { name: 'Room1', label: 'Living Room', tags: ['Location'] },
-        { name: 'Light1', label: 'Ceiling Light', groupNames: ['Room1'], tags: ['Light'] },
-        { name: 'PowerPoint', label: 'Power', groupNames: ['Light1'], tags: ['Point'] },
+        { name: 'Room1', label: 'Living Room', tags: ['LivingRoom'], metadata: { semantics: { value: 'Location_Indoor_Room_LivingRoom' } } },
+        { name: 'Light1', label: 'Ceiling Light', groupNames: ['Room1'], tags: ['Lightbulb'], metadata: { semantics: { value: 'Equipment_LightSource_Lightbulb' } } },
+        { name: 'PowerPoint', label: 'Power', groupNames: ['Light1'], tags: ['Switch'] },
       ];
       mock.onGet(`${baseUrl}/rest/items`).reply(200, mockItems);
 
@@ -352,7 +352,7 @@ describe('OpenHabClient', () => {
 
     it('should generate a concise system summary', async () => {
       mock.onGet(`${baseUrl}/rest/items`).reply(200, [
-        { name: 'L1', type: 'Switch', state: 'ON', tags: ['Location'] },
+        { name: 'L1', type: 'Switch', state: 'ON', tags: ['Indoor'], metadata: { semantics: { value: 'Location_Indoor' } } },
         { name: 'T1', type: 'Number', state: '25' },
       ]);
       mock.onGet(`${baseUrl}/rest/things`).reply(200, [
@@ -428,7 +428,7 @@ describe('OpenHabClient', () => {
       mock
         .onGet(`${baseUrl}/rest/items`)
         .reply(200, [
-          { name: 'L1', type: 'Switch', state: 'ON', tags: ['Location'], label: 'Living Room' },
+          { name: 'L1', type: 'Switch', state: 'ON', tags: ['LivingRoom'], label: 'Living Room', metadata: { semantics: { value: 'Location_Indoor_Room_LivingRoom' } } },
         ]);
       mock.onGet(`${baseUrl}/rest/things`).reply(200, []);
 
@@ -447,8 +447,8 @@ describe('OpenHabClient', () => {
 
     it('should generate Mermaid topology', async () => {
       mock.onGet(`${baseUrl}/rest/items`).reply(200, [
-        { name: 'Room1', tags: ['Location'], label: 'Kitchen' },
-        { name: 'Eq1', groupNames: ['Room1'], label: 'Fridge' },
+        { name: 'Room1', tags: ['Kitchen'], label: 'Kitchen', metadata: { semantics: { value: 'Location_Indoor_Room_Kitchen' } } },
+        { name: 'Eq1', groupNames: ['Room1'], label: 'Fridge', metadata: { semantics: { value: 'Equipment_WhiteGood_Refrigerator' } } },
       ]);
       const topology = await client.generateTopology();
       expect(topology).toContain('graph TD');

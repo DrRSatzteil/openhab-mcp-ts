@@ -40,11 +40,11 @@ describe('OpenHabClient Enhancements', () => {
 
   it('should find neighboring equipment in the same room', async () => {
     const mockItems = [
-      { name: 'Room1', label: 'Living Room', tags: ['Location'] },
-      { name: 'Light1', label: 'Ceiling Light', groupNames: ['Room1'], tags: ['Light'] },
-      { name: 'Speaker1', label: 'Sonos', groupNames: ['Room1'], tags: ['Speaker'] },
-      { name: 'Hallway', label: 'Hall', tags: ['Location'] },
-      { name: 'Light2', label: 'Hall Light', groupNames: ['Hallway'], tags: ['Light'] },
+      { name: 'Room1', label: 'Living Room', tags: ['LivingRoom'], metadata: { semantics: { value: 'Location_Indoor_Room_LivingRoom' } } },
+      { name: 'Light1', label: 'Ceiling Light', groupNames: ['Room1'], tags: ['Lightbulb'], metadata: { semantics: { value: 'Equipment_LightSource_Lightbulb' } } },
+      { name: 'Speaker1', label: 'Sonos', groupNames: ['Room1'], tags: ['Speaker'], metadata: { semantics: { value: 'Equipment_AudioVideoEquipment_Speaker' } } },
+      { name: 'Hallway', label: 'Hall', tags: ['Corridor'], metadata: { semantics: { value: 'Location_Indoor_Room_Corridor' } } },
+      { name: 'Light2', label: 'Hall Light', groupNames: ['Hallway'], tags: ['Lightbulb'], metadata: { semantics: { value: 'Equipment_LightSource_Lightbulb' } } },
     ];
     mock.onGet(`${baseUrl}/rest/items`).reply(200, mockItems);
 
