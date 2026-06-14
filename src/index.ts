@@ -2,6 +2,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { randomUUID } from 'crypto';
 import { OpenHabClient } from './openhab-client.js';
 import { registerTools } from './tools.js';
 
@@ -217,7 +218,7 @@ async function main() {
   registerTools(server, client);
 
   if (mcpTransport === 'streamable-http') {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
 
     const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       if (req.url?.startsWith('/mcp')) {
