@@ -221,11 +221,19 @@ async function main() {
 
     const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       if (req.url?.startsWith('/mcp')) {
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(chunk as Buffer);
-        const raw = Buffer.concat(chunks).toString();
-        const body = raw ? (JSON.parse(raw) as unknown) : undefined;
-        await transport.handleRequest(req, res, body);
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk as Buffer);
+          const raw = Buffer.concat(chunks).toString();
+          const body = raw ? (JSON.parse(raw) as unknown) : undefined;
+          await transport.handleRequest(req, res, body);
+        } catch (err) {
+          console.error('[OpenHAB MCP] Request handling error:', err);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: String(err) }));
+          }
+        }
       } else {
         res.writeHead(404);
         res.end();
