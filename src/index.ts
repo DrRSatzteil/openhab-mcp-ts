@@ -234,7 +234,12 @@ async function main() {
           transport.onclose = () => {
             if (transport.sessionId) sessions.delete(transport.sessionId);
           };
-          const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' });
+          const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' }, {
+            capabilities: {
+              resources: { subscribe: true, templates: true, list: true },
+              tools: { list: true, call: true, schemas: true },
+            },
+          } as any);
           setupServer(server, client);
           await server.connect(transport);
         } else {
@@ -261,7 +266,12 @@ async function main() {
     httpServer.listen(mcpPort, '0.0.0.0');
     console.error(`[OpenHAB MCP] HTTP server listening on :${mcpPort} — connected to ${openhabUrl}`);
   } else {
-    const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' });
+    const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' }, {
+      capabilities: {
+        resources: { subscribe: true, templates: true, list: true },
+        tools: { list: true, call: true, schemas: true },
+      },
+    } as any);
     setupServer(server, client);
     const transport = new StdioServerTransport();
     await server.connect(transport);
