@@ -416,7 +416,9 @@ export class OpenHabClient {
         addTo(byRoom, grp.toLowerCase(), item.name);
       }
 
-      if (item.tags?.some((t) => t.toLowerCase().includes('location'))) {
+      const semanticsValue =
+        (item.metadata as { semantics?: { value?: string } } | undefined)?.semantics?.value ?? '';
+      if (semanticsValue.startsWith('Location')) {
         rooms.push(item);
         // Let the room be searchable by its own label words too
         for (const t of tokenise(item.label ?? item.name)) addTo(byRoom, t, item.name);
@@ -460,7 +462,10 @@ export class OpenHabClient {
           if (!itemToRoom.has(memberName)) itemToRoom.set(memberName, room.name);
           const memberItem = itemMap.get(memberName);
           // Track direct Equipment parentage so Points can report their Equipment
-          if (memberItem?.tags?.some((t) => t.toLowerCase().includes('equipment'))) {
+          const memberSemantics =
+            (memberItem?.metadata as { semantics?: { value?: string } } | undefined)
+              ?.semantics?.value ?? '';
+          if (memberSemantics.startsWith('Equipment')) {
             const equipChildren = byRoom.get(memberName.toLowerCase());
             if (equipChildren) {
               for (const pointName of equipChildren) {
@@ -556,7 +561,11 @@ export class OpenHabClient {
       // Restrict fields projection to exclude heavy read-only fields (lastState,
       // lastStateUpdate, lastStateChange, stateDescription, link, editable, members).
       // Image items (e.g. Frigate camera snapshots) have 100 KB+ base64 in lastState.
-      params.fields = metadata
+      // Always include semantics metadata for the canonical all-items fetch so that
+      // buildSemanticIndex can detect Location/Equipment items via metadata.semantics.value.
+      // The semantics namespace is tiny vs full metadata=.*.
+      if (cacheKey === 'items_all' && !params.metadata) params.metadata = 'semantics';
+      params.fields = params.metadata
         ? 'name,state,label,type,category,tags,groupNames,metadata'
         : 'name,state,label,type,category,tags,groupNames';
       const response = await this.client.get('/rest/items', { params });
@@ -576,8 +585,8 @@ export class OpenHabClient {
           return true;
         });
       }
-      // Rebuild semantic index only from the slim 'items_all' fetch — the index only
-      // uses name/label/type/tags/groupNames, none of which require metadata.
+      // Rebuild semantic index from the items_all fetch (includes semantics metadata
+      // for Location/Equipment detection via metadata.semantics.value).
       if (cacheKey === 'items_all') {
         this.buildSemanticIndex(items);
       }
