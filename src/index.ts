@@ -243,8 +243,8 @@ async function main() {
           setupServer(server, client);
           await server.connect(transport);
         } else {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Bad request: missing or invalid session' }));
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Session not found: please re-initialize' }));
           return;
         }
 
