@@ -1,11 +1,15 @@
 import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { OpenHabClient } from './openhab-client.js';
 import { registerTools } from './tools.js';
 
 async function main() {
   const openhabUrl = process.env.OPENHAB_URL;
   const apiToken = process.env.OPENHAB_API_TOKEN;
+  const mcpTransport = process.env.MCP_TRANSPORT ?? 'stdio';
+  const mcpPort = parseInt(process.env.MCP_PORT ?? '8000', 10);
 
   // We enforce settings via Env variables
   if (!openhabUrl || !apiToken) {
@@ -212,14 +216,32 @@ async function main() {
   // Register Tools
   registerTools(server, client);
 
-  // Use stdio for communication with MCP Clients
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  if (mcpTransport === 'streamable-http') {
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
-  // This appears immediately in the client — before the background warm-up finishes
-  console.error(
-    `[OpenHAB MCP] Server connected to ${openhabUrl} — cache warm-up running in background.`
-  );
+    const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      if (req.url?.startsWith('/mcp')) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const raw = Buffer.concat(chunks).toString();
+        const body = raw ? (JSON.parse(raw) as unknown) : undefined;
+        await transport.handleRequest(req, res, body);
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+
+    await server.connect(transport);
+    httpServer.listen(mcpPort, '0.0.0.0');
+    console.error(`[OpenHAB MCP] HTTP server listening on :${mcpPort} — connected to ${openhabUrl}`);
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(
+      `[OpenHAB MCP] Server connected to ${openhabUrl} — cache warm-up running in background.`
+    );
+  }
 }
 
 main().catch((error) => {
