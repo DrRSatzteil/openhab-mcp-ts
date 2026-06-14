@@ -6,44 +6,16 @@ import { randomUUID } from 'crypto';
 import { OpenHabClient } from './openhab-client.js';
 import { registerTools } from './tools.js';
 
-async function main() {
-  const openhabUrl = process.env.OPENHAB_URL;
-  const apiToken = process.env.OPENHAB_API_TOKEN;
-  const mcpTransport = process.env.MCP_TRANSPORT ?? 'stdio';
-  const mcpPort = parseInt(process.env.MCP_PORT ?? '8000', 10);
+function isInitializeRequest(body: unknown): boolean {
+  return (
+    typeof body === 'object' &&
+    body !== null &&
+    'method' in body &&
+    (body as { method: string }).method === 'initialize'
+  );
+}
 
-  // We enforce settings via Env variables
-  if (!openhabUrl || !apiToken) {
-    console.error('Error: OPENHAB_URL and OPENHAB_API_TOKEN environment variables are required.');
-    console.error(
-      'Example: OPENHAB_URL=http://openhab.localdomain:8080 OPENHAB_API_TOKEN=oh.mytoken node dist/index.js'
-    );
-    process.exit(1);
-  }
-
-  // Set up MCP Server
-  const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' }, {
-    // Advertise explicit capabilities so MCP clients (and different LLM runtimes)
-    // can discover available resources and tool calling support. Some model
-    // implementations (e.g. newer models in VS Code) require richer capability
-    // metadata to enable tool/resource usage.
-    capabilities: {
-      resources: {
-        subscribe: true,
-        templates: true,
-        list: true,
-      },
-      tools: {
-        list: true,
-        call: true,
-        schemas: true,
-      },
-    },
-  } as any);
-
-  // Initialize Client
-  const client = new OpenHabClient(openhabUrl, apiToken);
-
+function setupServer(server: McpServer, client: OpenHabClient): void {
   // --- Static Resources ---
 
   server.registerResource(
@@ -214,37 +186,83 @@ async function main() {
     }
   );
 
-  // Register Tools
+  // --- Tools ---
   registerTools(server, client);
+}
+
+async function main() {
+  const openhabUrl = process.env.OPENHAB_URL;
+  const apiToken = process.env.OPENHAB_API_TOKEN;
+  const mcpTransport = process.env.MCP_TRANSPORT ?? 'stdio';
+  const mcpPort = parseInt(process.env.MCP_PORT ?? '8000', 10);
+
+  if (!openhabUrl || !apiToken) {
+    console.error('Error: OPENHAB_URL and OPENHAB_API_TOKEN environment variables are required.');
+    console.error(
+      'Example: OPENHAB_URL=http://openhab.localdomain:8080 OPENHAB_API_TOKEN=oh.mytoken node dist/index.js'
+    );
+    process.exit(1);
+  }
+
+  const client = new OpenHabClient(openhabUrl, apiToken);
 
   if (mcpTransport === 'streamable-http') {
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+    // Session map: sessionId → transport (one McpServer+Transport per MCP client session)
+    const sessions = new Map<string, StreamableHTTPServerTransport>();
 
     const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-      if (req.url?.startsWith('/mcp')) {
-        try {
-          const chunks: Buffer[] = [];
-          for await (const chunk of req) chunks.push(chunk as Buffer);
-          const raw = Buffer.concat(chunks).toString();
-          const body = raw ? (JSON.parse(raw) as unknown) : undefined;
-          await transport.handleRequest(req, res, body);
-        } catch (err) {
-          console.error('[OpenHAB MCP] Request handling error:', err);
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: String(err) }));
-          }
-        }
-      } else {
+      if (!req.url?.startsWith('/mcp')) {
         res.writeHead(404);
         res.end();
+        return;
+      }
+
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const raw = Buffer.concat(chunks).toString();
+        const body = raw ? (JSON.parse(raw) as unknown) : undefined;
+
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        let transport: StreamableHTTPServerTransport;
+
+        if (sessionId && sessions.has(sessionId)) {
+          transport = sessions.get(sessionId)!;
+        } else if (isInitializeRequest(body)) {
+          // New MCP client: create a fresh server+transport per session so reconnects work
+          transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+          transport.onclose = () => {
+            if (transport.sessionId) sessions.delete(transport.sessionId);
+          };
+          const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' });
+          setupServer(server, client);
+          await server.connect(transport);
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Bad request: missing or invalid session' }));
+          return;
+        }
+
+        await transport.handleRequest(req, res, body);
+
+        // Capture session ID after initialize so subsequent requests can be routed
+        if (transport.sessionId && !sessions.has(transport.sessionId)) {
+          sessions.set(transport.sessionId, transport);
+        }
+      } catch (err) {
+        console.error('[OpenHAB MCP] Request handling error:', err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: String(err) }));
+        }
       }
     });
 
-    await server.connect(transport);
     httpServer.listen(mcpPort, '0.0.0.0');
     console.error(`[OpenHAB MCP] HTTP server listening on :${mcpPort} — connected to ${openhabUrl}`);
   } else {
+    const server = new McpServer({ name: 'openhab-mcp', version: '1.0.0' });
+    setupServer(server, client);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error(
